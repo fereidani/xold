@@ -105,6 +105,25 @@ impl<'d> GotPlan<'d> {
         u32::try_from(self.keys.len()).unwrap_or(u32::MAX)
     }
 
+    /// Ensures a global has a slot, returning its index. Imported functions
+    /// need a non-lazy pointer behind their synthetic stub even when no input
+    /// relocation explicitly names the GOT.
+    pub fn ensure_global(&mut self, name: &'d [u8]) -> u32 {
+        let key = GotKey::Global(name);
+        if let Some(&slot) = self.index.get(&key) {
+            return slot;
+        }
+        let slot = u32::try_from(self.keys.len()).unwrap_or(u32::MAX);
+        self.index.insert(key, slot);
+        self.keys.push(key);
+        slot
+    }
+
+    /// The slot belonging to a named global, if one was allocated.
+    pub fn global_slot(&self, name: &[u8]) -> Option<u32> {
+        self.index.get(&GotKey::Global(name)).copied()
+    }
+
     /// The slot index of one file's symbol, if it has a GOT entry.
     pub fn slot(
         &self,

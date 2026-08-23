@@ -8,6 +8,7 @@ use xold::{
     buildid::{self, BuildId},
     dynamic::{HashStyle, Strip, ZOptions},
     icf::IcfMode,
+    macho::{MachoTarget, PlatformVersion},
     search::LibKind,
 };
 
@@ -72,6 +73,11 @@ pub const ATTACHED: [(&str, Attached); 19] = [
 
 /// Splits an attached option into what it sets and the value it sets it to.
 pub fn attached(arg: &str) -> Option<(Attached, &str)> {
+    // ld64's `-mllvm OPTION` is a separated option. Do not let the GNU-ld
+    // attached `-mEMULATION` spelling consume its name and strand OPTION.
+    if arg == "-mllvm" {
+        return None;
+    }
     ATTACHED.iter().find_map(|&(prefix, opt)| {
         arg.strip_prefix(prefix)
             .filter(|rest| !rest.is_empty())
@@ -163,7 +169,72 @@ pub fn is_noop_flag(arg: &str) -> bool {
             // xold emits no warnings, so there is none to promote or demote.
             | "--fatal-warnings"
             | "--no-fatal-warnings"
+            // ld64 enables these presentation/optimisation choices in its
+            // driver invocation. They do not alter xold's linked semantics.
+            | "-demangle"
+            | "-no_deduplicate"
     )
+}
+
+/// Reads the two architecture names supported by the Mach-O backend.
+pub fn parse_macho_arch(
+    value: &str,
+) -> std::result::Result<MachoTarget, String> {
+    match value {
+        "arm64" => Ok(MachoTarget::Arm64),
+        "x86_64" => Ok(MachoTarget::X86_64),
+        other => Err(format!(
+            "xold: unsupported -arch value `{other}` (expected arm64|x86_64)"
+        )),
+    }
+}
+
+/// Reads ld64's `-platform_version PLATFORM MIN SDK` triple.
+pub fn parse_platform_version(
+    platform: &str,
+    min_os: &str,
+    sdk: &str,
+) -> std::result::Result<PlatformVersion, String> {
+    let platform = match platform {
+        "macos" => 1,
+        other => {
+            return Err(format!(
+                "xold: unsupported Mach-O platform `{other}` (expected macos)"
+            ));
+        }
+    };
+    Ok(PlatformVersion {
+        platform,
+        min_os: parse_macho_version(min_os)?,
+        sdk: parse_macho_version(sdk)?,
+    })
+}
+
+/// Packs `major[.minor[.patch]]` as Mach-O load commands do.
+fn parse_macho_version(value: &str) -> std::result::Result<u32, String> {
+    let mut parts = value.split('.');
+    let parse = |part: Option<&str>| -> Option<u32> {
+        match part {
+            None => Some(0),
+            Some("") => None,
+            Some(n) => n.parse().ok(),
+        }
+    };
+    let major = parse(parts.next());
+    let minor = parse(parts.next());
+    let patch = parse(parts.next());
+    let valid = parts.next().is_none()
+        && major.is_some_and(|n| n <= 0xffff)
+        && minor.is_some_and(|n| n <= 0xff)
+        && patch.is_some_and(|n| n <= 0xff);
+    if !valid {
+        return Err(format!(
+            "xold: invalid Mach-O version `{value}` (expected major[.minor[.patch]])"
+        ));
+    }
+    Ok((major.unwrap_or(0) << 16)
+        | (minor.unwrap_or(0) << 8)
+        | patch.unwrap_or(0))
 }
 
 /// Parses argv into options, or returns a usage message. `-l` and `-L` are
@@ -339,6 +410,10 @@ pub struct Parsed {
     pub interpreter: String,
     pub icf: IcfMode,
     pub sw: Switches,
+    pub macho_dynamic: bool,
+    pub macho_arch: Option<MachoTarget>,
+    pub macho_platform: Option<PlatformVersion>,
+    pub macho_dead_strip: bool,
 }
 
 impl Default for Parsed {
@@ -361,6 +436,10 @@ impl Default for Parsed {
             interpreter: String::from(DEFAULT_INTERP),
             icf: IcfMode::None,
             sw: Switches::default(),
+            macho_dynamic: false,
+            macho_arch: None,
+            macho_platform: None,
+            macho_dead_strip: false,
         }
     }
 }
@@ -417,6 +496,10 @@ impl Parsed {
             relax: !self.sw.relax_off,
             relax_named: self.sw.relax_named,
             no_fork: self.sw.no_fork,
+            macho_dynamic: self.macho_dynamic,
+            macho_arch: self.macho_arch,
+            macho_platform: self.macho_platform,
+            macho_dead_strip: self.macho_dead_strip,
         }
     }
 }

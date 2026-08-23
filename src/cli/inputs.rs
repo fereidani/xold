@@ -29,6 +29,9 @@ pub struct Inputs {
     pub from_l: Vec<bool>,
     pub search: Vec<PathBuf>,
     pub sysroot: Option<PathBuf>,
+    /// The sysroot came from ld64's `-syslibroot`, so `-l` searches for
+    /// Darwin `.tbd`/`.dylib` libraries instead of ELF `.so` files.
+    pub macho_libraries: bool,
     /// Whether a `--start-lib` group is open, so the plain files that follow
     /// join it instead of the input list.
     pub in_lib: bool,
@@ -74,8 +77,11 @@ impl Inputs {
                     .into(),
             );
         }
-        let path =
-            library(name, &self.search, self.sysroot.as_deref(), self.kind)?;
+        let path = if self.macho_libraries && self.kind == LibKind::Any {
+            macho_library(name, &self.search, self.sysroot.as_deref())?
+        } else {
+            library(name, &self.search, self.sysroot.as_deref(), self.kind)?
+        };
         self.paths.push(path);
         self.from_l.push(true);
         self.as_needed_flags.push(self.as_needed);
@@ -136,15 +142,20 @@ pub fn parse_sysroot(
             i += 1;
             continue;
         };
-        if arg == "--sysroot" {
+        if arg == "--sysroot" || arg == "-syslibroot" {
             i += 1;
-            sysroot = Some(PathBuf::from(next_os(args, i, "--sysroot")?));
+            sysroot = Some(PathBuf::from(next_os(args, i, arg)?));
         } else if let Some(path) = arg.strip_prefix("--sysroot=") {
             sysroot = Some(PathBuf::from(path));
         }
         i += 1;
     }
     Ok(sysroot)
+}
+
+/// Whether this command line selects ld64's Darwin library search rules.
+pub fn has_syslibroot(args: &[OsString]) -> bool {
+    args.iter().any(|arg| arg == "-syslibroot")
 }
 
 /// Collects every `-L` directory before any `-l` is resolved.
@@ -194,4 +205,14 @@ pub fn library(
             ),
         },
     )
+}
+
+/// Resolves a Darwin `-lNAME` against `.tbd`, `.dylib`, then `.a` files.
+fn macho_library(
+    name: &str,
+    search_path: &[PathBuf],
+    sysroot: Option<&Path>,
+) -> std::result::Result<PathBuf, String> {
+    search::find_macho_library(name, search_path, sysroot)
+        .ok_or_else(|| format!("xold: cannot find Mach-O -l{name}"))
 }

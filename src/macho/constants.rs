@@ -75,11 +75,19 @@ pub const LC_SYMTAB: u32 = 0x02;
 /// Dynamic symbol table load command; describes local/external/undefined
 /// symbol ranges and the indirect-symbol table.
 pub const LC_DYSYMTAB: u32 = 0x0b;
+/// Load the dynamic linker named by the command's string payload.
+pub const LC_LOAD_DYLINKER: u32 = 0x0e;
+/// Load one dynamic library dependency.
+pub const LC_LOAD_DYLIB: u32 = 0x0c;
 /// A 16-byte unique image identifier.
 pub const LC_UUID: u32 = 0x1b;
 /// Main entry point (`entryoff` into `__TEXT`). Modern darwin executables use
 /// this in preference to `LC_UNIXTHREAD`.
 pub const LC_MAIN: u32 = 0x28 | LC_REQ_DYLD;
+/// Deployment platform, minimum OS and SDK version.
+pub const LC_BUILD_VERSION: u32 = 0x32;
+/// Classic dyld rebase/bind/export byte streams.
+pub const LC_DYLD_INFO_ONLY: u32 = 0x22 | LC_REQ_DYLD;
 /// Flag bit OR-ed into a load command `cmd` when dyld must understand the
 /// command to launch the image. `LC_MAIN` sets it because a `LC_MAIN`-only
 /// image has no thread state to boot directly.
@@ -131,6 +139,10 @@ pub const S_8BYTE_LITERALS: u32 = 0x4;
 /// Non-lazy symbol pointer table (the GOT on darwin): one 8-byte slot per
 /// external data symbol, resolved at link time for a static executable.
 pub const S_NON_LAZY_SYMBOL_POINTERS: u32 = 0x6;
+/// Fixed-size symbol stubs; `reserved2` is the size of one stub.
+pub const S_SYMBOL_STUBS: u32 = 0x8;
+/// Thread-local zero-fill data.
+pub const S_THREAD_LOCAL_ZEROFILL: u32 = 0x12;
 
 /// Mask selecting the section attributes (above the type byte).
 pub const SECTION_ATTRIBUTES: u32 = 0xffff_ff00;
@@ -195,3 +207,11 @@ pub const VM_PROT_EXECUTE: u32 = 0x4;
 /// The image has no undefined symbols (every reference resolves at link time).
 /// Set on a fully-static executable so dyld skips the undefined check.
 pub const MH_NOUNDEFS: u32 = 0x0000_0001;
+/// Image is an input to the dynamic linker.
+pub const MH_DYLDLINK: u32 = 0x0000_0004;
+/// Undefined symbols carry two-level library ordinals.
+pub const MH_TWOLEVEL: u32 = 0x0000_0080;
+/// Executable may be slid from its preferred address.
+pub const MH_PIE: u32 = 0x0020_0000;
+/// Image contains `S_THREAD_LOCAL_VARIABLES` descriptors for dyld to register.
+pub const MH_HAS_TLV_DESCRIPTORS: u32 = 0x0080_0000;

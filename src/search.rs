@@ -60,6 +60,44 @@ pub fn find_library(
     find_library_kind(name, search, sysroot, LibKind::Any)
 }
 
+/// Resolves a Darwin `-l name`, preferring the SDK's text-based API stub,
+/// then a real dylib, then a static archive.
+///
+/// ld64's `-syslibroot` re-roots `/usr/lib`, where Apple SDKs publish
+/// `libSystem.tbd`, `libc.tbd` and `libm.tbd`. Explicit `-L` paths keep their
+/// ordinary meaning, matching the ELF search path handling in this module.
+pub fn find_macho_library(
+    name: &str,
+    search: &[PathBuf],
+    sysroot: Option<&Path>,
+) -> Option<PathBuf> {
+    let exact = name.strip_prefix(':');
+    let look = |dir: &Path| {
+        if let Some(file) = exact {
+            let path = dir.join(file);
+            return path.exists().then_some(path);
+        }
+        for suffix in [".tbd", ".dylib", ".a"] {
+            let path = dir.join(format!("lib{name}{suffix}"));
+            if path.exists() {
+                return Some(path);
+            }
+        }
+        None
+    };
+    for dir in search.iter().map(|dir| rooted_search(sysroot, dir)) {
+        if let Some(found) = look(&dir) {
+            return Some(found);
+        }
+    }
+    for dir in DEFAULT_PATHS {
+        if let Some(found) = look(&rooted(sysroot, dir)) {
+            return Some(found);
+        }
+    }
+    None
+}
+
 /// Which files a `-l` search will accept.
 ///
 /// A command line switches between the two with `-Bstatic` and `-Bdynamic`,

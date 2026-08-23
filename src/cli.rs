@@ -11,7 +11,7 @@ use std::{
     path::PathBuf,
 };
 
-use inputs::{Inputs, parse_search_path, parse_sysroot};
+use inputs::{Inputs, has_syslibroot, parse_search_path, parse_sysroot};
 use opts::{
     Attached, Parsed, attached, is_noop_flag, parse_build_id, parse_hash_style,
     parse_icf, parse_lib_marker, positional, raw_argument,
@@ -21,6 +21,7 @@ use xold::{
     buildid::BuildId,
     dynamic::{HashStyle, Strip, ZOptions},
     icf::IcfMode,
+    macho::{MachoTarget, PlatformVersion},
     search::LibKind,
 };
 
@@ -94,6 +95,15 @@ pub struct Options {
     /// Whether to run the link in the calling process rather than a forked
     /// child. See [`xold::detach`].
     pub no_fork: bool,
+    /// `-dynamic`: produce a dyld-launched Mach-O executable.
+    pub macho_dynamic: bool,
+    /// `-arch`: the Mach-O target named by the compiler driver.
+    pub macho_arch: Option<MachoTarget>,
+    /// `-platform_version`: deployment target and SDK metadata.
+    pub macho_platform: Option<PlatformVersion>,
+    /// `-dead_strip`: requested Mach-O dead stripping. The current writer
+    /// records the request but has no atom-level liveness pass yet.
+    pub macho_dead_strip: bool,
 }
 /// What the command line asked for.
 ///
@@ -122,6 +132,7 @@ pub fn parse(args: &[OsString]) -> std::result::Result<Request, String> {
     let mut inputs = Inputs {
         search,
         sysroot,
+        macho_libraries: has_syslibroot(args),
         ..Default::default()
     };
     if let Some(text) = asked_about_itself(args) {
@@ -269,6 +280,22 @@ fn separated(
         "-plugin" | "-plugin-opt" => {
             let _ = next(args, at, arg)?;
         }
+        // ld64 driver plumbing that does not affect a non-LTO input link.
+        "-lto_library" | "-mllvm" => {
+            let _ = next(args, at, arg)?;
+        }
+        "-arch" => {
+            p.macho_arch =
+                Some(opts::parse_macho_arch(next(args, at, "-arch")?)?);
+        }
+        "-platform_version" => {
+            let platform = next(args, at, "-platform_version")?;
+            let min_os = next(args, at + 1, "-platform_version")?;
+            let sdk = next(args, at + 2, "-platform_version")?;
+            p.macho_platform =
+                Some(opts::parse_platform_version(platform, min_os, sdk)?);
+            return Ok(Some(at + 3));
+        }
         "--version-script" | "-version-script" => {
             p.version_script = Some(next(args, at, "--version-script")?.into());
         }
@@ -290,7 +317,7 @@ fn separated(
         }
         "-z" => p.zkeyword(next(args, at, "-z")?)?,
         "-l" => inputs.library(next(args, at, "-l")?)?,
-        "--sysroot" | "-L" => {}
+        "--sysroot" | "-syslibroot" | "-L" => {}
         _ => return Ok(None),
     }
     Ok(Some(at + 1))
@@ -312,6 +339,8 @@ fn plain(
             p.sw.static_link = true;
             inputs.kind = LibKind::ArchiveOnly;
         }
+        "-dynamic" => p.macho_dynamic = true,
+        "-dead_strip" => p.macho_dead_strip = true,
         "--no-threads" => p.threads = Some(1),
         s if s.starts_with("-z") && s.len() > 2 => p.zkeyword(&s[2..])?,
         // `--no-undefined` is the same request as `-z defs`, which is how GNU

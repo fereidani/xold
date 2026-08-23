@@ -1,0 +1,17 @@
+# Flags for `cargo miri test`. Cargo applies these to every command, but
+# MIRIFLAGS is read only by Miri, so an ordinary build ignores them.
+#
+# `-Zmiri-tree-borrows` selects Tree Borrows over the default Stacked
+# Borrows. The choice is forced by a dependency, not by xold: rayon's work
+# stealing reaches crossbeam-epoch, whose intrusive list builds a reference
+# to a node it reached through a raw pointer, which Stacked Borrows rejects.
+# No xold code is on that path and no aliasing rule of ours depends on the
+# model, so the weaker of the two experimental models is the one that lets
+# the run reach our code at all.
+#
+# `-Zmiri-disable-isolation` lets the tests read their on-disk fixtures.
+# Miri denies file access by default; the tests that need more than reading
+# -- spawning a compiler, mapping a file -- are marked `ignore` under Miri
+# rather than smuggled past the sandbox.
+[env]
+MIRIFLAGS = "-Zmiri-tree-borrows -Zmiri-disable-isolation"

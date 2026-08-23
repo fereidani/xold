@@ -1,0 +1,47 @@
+[package]
+name = "xold"
+version = "0.0.1"
+edition = "2024"
+description = "A maintainable multi-threaded linker for ELF, Mach-O and COFF."
+license = "MIT"
+authors = ["Khashayar Fereidani"]
+repository = "https://github.com/fereidani/xold"
+documentation = "https://docs.rs/xold"
+keywords = ["linker", "elf", "mach-o", "coff", "ld"]
+categories = ["development-tools::build-utils", "compilers", "command-line-utilities"]
+readme = "README.md"
+
+[lib]
+name = "xold"
+path = "src/lib.rs"
+
+[[bin]]
+name = "xold"
+path = "src/main.rs"
+
+[dependencies]
+memmap2 = "0.9"
+bytemuck = { version = "1", features = ["derive"] }
+rustc-hash = "2"
+rayon = "1.12"
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+hashbrown = { version = "0.17", default-features = false }
+mimalloc = "0.1"
+object = "0.39"
+
+[profile.perf]
+inherits = "release"
+debug = 1
+
+[profile.release]
+debug = 0
+lto = "fat"
+panic = "abort"
+codegen-units = 1
+rpath = false
+strip = true
+
+[lints.clippy]
+pedantic = { level = "deny", priority = -1 }
+nursery = { level = "warn", priority = -1 }

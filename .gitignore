@@ -1,0 +1,15 @@
+/target
+/local
+
+# Generated benchmark inputs and outputs (bench/gen.sh rebuilds them).
+/bench/objs
+/bench/out*
+/bench/gen
+/bench/llvmobjs
+
+# Profiler captures.
+*.data
+*.old
+*.core
+*.o
+*.cpp

@@ -16,27 +16,34 @@ use std::{hash::Hasher, path::Path};
 use rustc_hash::{FxHashMap, FxHashSet, FxHasher};
 
 use crate::{
+    archive::{self, Archive},
     endian::{U16, U32, U64},
     error::{Error, Result},
-    input::{Input, InputBytes},
+    input::{AlignedBytes, Format, Input, InputBytes},
     macho::{
-        self, GotPlan, MachOFile,
+        self, GotPlan, LinkOptions, MachOFile,
         constants::{
             ARM_THREAD_STATE64, ARM_THREAD_STATE64_COUNT,
             ARM_THREAD_STATE64_PC, CPU_SUBTYPE_ARM64_ALL,
             CPU_SUBTYPE_X86_64_ALL, INDIRECT_SYMBOL_ABS, INDIRECT_SYMBOL_LOCAL,
-            LC_DYSYMTAB, LC_SEGMENT_64, LC_SYMTAB, LC_UNIXTHREAD, LC_UUID,
-            MH_EXECUTE, MH_MAGIC_64, MH_NOUNDEFS, N_ABS, N_EXT, N_SECT, N_TYPE,
-            N_UNDF, PAGEZERO_SIZE, VM_PROT_READ, X86_THREAD_STATE64,
-            X86_THREAD_STATE64_COUNT, X86_THREAD_STATE64_RIP,
+            LC_BUILD_VERSION, LC_DYLD_INFO_ONLY, LC_DYSYMTAB, LC_LOAD_DYLIB,
+            LC_LOAD_DYLINKER, LC_MAIN, LC_SEGMENT_64, LC_SYMTAB, LC_UNIXTHREAD,
+            LC_UUID, MH_DYLDLINK, MH_EXECUTE, MH_HAS_TLV_DESCRIPTORS,
+            MH_MAGIC_64, MH_NOUNDEFS, MH_PIE, MH_TWOLEVEL, N_ABS, N_EXT,
+            N_SECT, N_TYPE, N_UNDF, N_WEAK_REF, PAGEZERO_SIZE, VM_PROT_READ,
+            X86_THREAD_STATE64, X86_THREAD_STATE64_COUNT,
+            X86_THREAD_STATE64_RIP,
         },
         got::GotKey,
+        imports::ImportPlan,
         layout::{
             self, GotLayout, HEADER_SIZE, MachLayout, OutSegment, TEXT_BASE,
         },
         lc::{
-            DysymtabCommand, MachHeader64, Nlist64, SectionHeader64,
-            SegmentCommand64, SymtabCommand, ThreadCommand, UuidCommand,
+            BuildVersionCommand, DyldInfoCommand, DylibCommand,
+            DylinkerCommand, DysymtabCommand, EntryPointCommand, MachHeader64,
+            Nlist64, SectionHeader64, SegmentCommand64, SymtabCommand,
+            ThreadCommand, UuidCommand,
         },
         reloc::MachoTarget,
         sections,
@@ -55,19 +62,67 @@ pub fn link_macho(
     output: &Path,
     entry: &[u8],
 ) -> Result<()> {
+    link_macho_with_options(inputs, output, entry, &LinkOptions::default())
+}
+
+/// Links a Mach-O executable with driver-selected architecture and load
+/// command metadata.
+pub fn link_macho_with_options(
+    inputs: &[Input<'_>],
+    output: &Path,
+    entry: &[u8],
+    options: &LinkOptions<'_>,
+) -> Result<()> {
     let opened = open_all(inputs)?;
-    let bytes: Vec<&[u8]> = opened.iter().map(InputBytes::bytes).collect();
+    let expanded = expand_archives(&opened)?;
+    let bytes: Vec<&[u8]> = expanded.iter().map(MachInput::bytes).collect();
     // The Mach-O driver does not share the ELF pipeline, so it sizes its own
     // pool here for the same reason and by the same rule.
     pool::run(&bytes, || {
         let inputs = parse_all(&bytes)?;
-        let image = write_executable(&inputs, entry)?;
+        let image = write_executable(&inputs, entry, options)?;
         // Nothing may be published that a serialiser could not reach: the
         // writers size the image from the layout, so a write past its end is a
         // sizing bug.
         crate::util::check_truncated_write()?;
         write_output(output, &image)
     })
+}
+
+/// One direct Mach-O object or an aligned copy of an archive member.
+enum MachInput<'a> {
+    Borrowed(&'a [u8]),
+    Owned(AlignedBytes),
+}
+
+impl MachInput<'_> {
+    fn bytes(&self) -> &[u8] {
+        match self {
+            Self::Borrowed(bytes) => bytes,
+            Self::Owned(bytes) => bytes.bytes(),
+        }
+    }
+}
+
+/// Expands Darwin `.rlib`/`.a` inputs. Non-object members are Rust metadata
+/// or archive indexes and do not participate in the native link.
+fn expand_archives<'a>(
+    opened: &'a [InputBytes<'_>],
+) -> Result<Vec<MachInput<'a>>> {
+    let mut out = Vec::new();
+    for input in opened {
+        let bytes = input.bytes();
+        if !Archive::is_archive(bytes) {
+            out.push(MachInput::Borrowed(bytes));
+            continue;
+        }
+        for member in archive::members(bytes)? {
+            if Format::detect(member) == Some(Format::MachO) {
+                out.push(MachInput::Owned(AlignedBytes::new(member)));
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// Parses every input as a 64-bit Mach-O object, in parallel. Each parse is
@@ -79,14 +134,55 @@ fn parse_all<'d>(bytes: &'d [&'d [u8]]) -> Result<Vec<MachOFile<'d>>> {
 }
 
 /// Builds the full `MH_EXECUTE` byte image for `inputs`.
-fn write_executable(inputs: &[MachOFile<'_>], entry: &[u8]) -> Result<Vec<u8>> {
+fn write_executable(
+    inputs: &[MachOFile<'_>],
+    entry: &[u8],
+    options: &LinkOptions<'_>,
+) -> Result<Vec<u8>> {
     let target = derive_target(inputs)?;
-    let plan = SymtabPlan::build(inputs)?;
-    let got_plan = GotPlan::scan(inputs, target)?;
+    if options.arch.is_some_and(|arch| arch != target) {
+        return Err(Error::CommandLine(
+            "-arch disagrees with the Mach-O input objects".into(),
+        ));
+    }
     let globals = Globals::build(inputs)?;
-    // The indirect symbol table rides `__LINKEDIT` after the string
-    // table: one row index per `__got` slot.
-    let linkedit_size = plan.linkedit_size() + u64::from(got_plan.count()) * 4;
+    let imports = ImportPlan::build(inputs, &globals, target, options)?;
+    let mut got_plan = GotPlan::scan(inputs, target)?;
+    for import in imports.stubs() {
+        got_plan.ensure_global(import.name);
+    }
+    let plan = SymtabPlan::build(inputs)?;
+    // The indirect symbol table follows the symbol/string table. Dynamic
+    // opcode streams are planned from the resulting section addresses, then
+    // a second layout stamps their final __LINKEDIT size; earlier segments do
+    // not depend on that size and therefore stay identical.
+    let indirect_count = imports.stub_count().saturating_add(got_plan.count());
+    let streams_relative = plan
+        .linkedit_size()
+        .saturating_add(u64::from(indirect_count) * 4);
+    let provisional = layout::build(
+        inputs,
+        streams_relative,
+        entry,
+        got_plan.count(),
+        &globals.commons,
+        target,
+        options,
+        imports.stub_count(),
+    )?;
+    let dynamic = build_dynamic_info(
+        inputs,
+        &provisional,
+        &got_plan,
+        &imports,
+        &globals,
+    )?;
+    let rebase_relative = streams_relative;
+    let bind_relative = rebase_relative.saturating_add(
+        u64::try_from(dynamic.rebase.len()).unwrap_or(u64::MAX),
+    );
+    let linkedit_size = bind_relative
+        .saturating_add(u64::try_from(dynamic.bind.len()).unwrap_or(u64::MAX));
     let layout = layout::build(
         inputs,
         linkedit_size,
@@ -94,16 +190,24 @@ fn write_executable(inputs: &[MachOFile<'_>], entry: &[u8]) -> Result<Vec<u8>> {
         got_plan.count(),
         &globals.commons,
         target,
+        options,
+        imports.stub_count(),
     )?;
     let common_addr = common_addr_map(&globals, &layout);
-    let sym_addr =
-        resolve_all(inputs, &globals, &common_addr, &layout.sec_vaddr)?;
+    let sym_addr = resolve_all(
+        inputs,
+        &globals,
+        &common_addr,
+        &layout.sec_vaddr,
+        &imports,
+        layout.stubs,
+    )?;
     let got_addr = build_got_addr(inputs, &got_plan, layout.got);
     let sec_ordinal = section_ordinal_map(&layout)?;
 
     let total = layout.linkedit_fileoff + layout.linkedit_filesize;
     let mut image = vec![0u8; usize::try_from(total).unwrap_or(usize::MAX)];
-    write_header(&mut image, target, &layout);
+    write_header(&mut image, target, &layout, options);
     write_commands(
         &mut image,
         target,
@@ -111,8 +215,16 @@ fn write_executable(inputs: &[MachOFile<'_>], entry: &[u8]) -> Result<Vec<u8>> {
         &plan,
         &sym_addr,
         &sec_ordinal,
+        options,
+        rebase_relative,
+        u32::try_from(dynamic.rebase.len()).unwrap_or(u32::MAX),
+        bind_relative,
+        u32::try_from(dynamic.bind.len()).unwrap_or(u32::MAX),
+        imports.stub_count(),
     )?;
     write_sections(&mut image, inputs, target, &layout, &sym_addr, &got_addr)?;
+    write_tls_descriptors(&mut image, inputs, &layout, &sym_addr)?;
+    write_stubs(&mut image, &layout, &imports, &got_plan)?;
     if let Some(got) = layout.got {
         fill_got(&mut image, got, &got_plan, &globals, &sym_addr);
     }
@@ -123,6 +235,11 @@ fn write_executable(inputs: &[MachOFile<'_>], entry: &[u8]) -> Result<Vec<u8>> {
         &sym_addr,
         &sec_ordinal,
         &got_plan,
+        &imports,
+        rebase_relative,
+        &dynamic.rebase,
+        bind_relative,
+        &dynamic.bind,
     );
     Ok(image)
 }
@@ -148,12 +265,35 @@ fn resolve_all(
     globals: &Globals<'_>,
     common_addr: &FxHashMap<&[u8], u64>,
     sec_vaddr: &[Vec<u64>],
+    imports: &ImportPlan<'_>,
+    stubs: Option<layout::StubLayout>,
 ) -> Result<Vec<Vec<u64>>> {
     let mut out = Vec::with_capacity(inputs.len());
     for (file, input) in inputs.iter().enumerate() {
         let n = input.symbols().len();
         let mut addrs = vec![0u64; n];
         for (i, slot) in addrs.iter_mut().enumerate() {
+            let Some(sym) = input.symbols().nth(i) else {
+                continue;
+            };
+            if sym.n_type & N_TYPE == N_UNDF && sym.n_value == 0 {
+                if let Some(import) = imports.get(sym.name) {
+                    *slot =
+                        import.stub.zip(stubs).map_or(0, |(stub, layout)| {
+                            layout.addr.wrapping_add(u64::from(stub) * 12)
+                        });
+                    continue;
+                }
+                if sym.n_desc & N_WEAK_REF != 0 {
+                    *slot = 0;
+                    continue;
+                }
+                if matches!(sym.name, b"__mh_execute_header" | b"___dso_handle")
+                {
+                    *slot = TEXT_BASE;
+                    continue;
+                }
+            }
             *slot = symtab::symbol_addr(
                 inputs,
                 globals,
@@ -166,6 +306,236 @@ fn resolve_all(
         out.push(addrs);
     }
     Ok(out)
+}
+
+struct DynamicInfo {
+    rebase: Vec<u8>,
+    bind: Vec<u8>,
+}
+
+/// Plans classic dyld rebases and eager binds. Absolute pointer relocations
+/// in input data need to move with a PIE slide; an absolute reference to a
+/// TAPI import (notably `__tlv_bootstrap` in `__thread_vars`) binds at its
+/// final section location rather than through the synthetic GOT.
+fn build_dynamic_info(
+    inputs: &[MachOFile<'_>],
+    layout: &MachLayout,
+    got: &GotPlan<'_>,
+    imports: &ImportPlan<'_>,
+    globals: &Globals<'_>,
+) -> Result<DynamicInfo> {
+    let mut bind = Vec::new();
+    if let Some(got_layout) = layout.got {
+        let data = layout
+            .data
+            .as_ref()
+            .ok_or(Error::Format("Mach-O GOT has no data segment"))?;
+        for (slot, key) in got.iter() {
+            let GotKey::Global(name) = key else {
+                continue;
+            };
+            let Some(import) = imports.get(name) else {
+                continue;
+            };
+            let offset = got_layout
+                .addr
+                .wrapping_sub(data.vmaddr)
+                .wrapping_add(u64::from(slot) * 8);
+            append_bind(&mut bind, import.dylib, name, 2, offset);
+        }
+    }
+
+    let mut rebases = Vec::new();
+    let mut seen_rebase = FxHashSet::default();
+    let mut seen_bind = FxHashSet::default();
+    for (segment_index, segment) in
+        [(1u8, Some(&layout.text)), (2u8, layout.data.as_ref())]
+    {
+        let Some(segment) = segment else {
+            continue;
+        };
+        for section in &segment.sections {
+            for member in &section.members {
+                let input = inputs
+                    .get(member.file)
+                    .ok_or(Error::OutOfRange("Mach-O fixup input"))?;
+                let input_section = input
+                    .sections()
+                    .into_iter()
+                    .find(|candidate| candidate.index == member.section)
+                    .ok_or(Error::OutOfRange("Mach-O fixup section"))?;
+                let symbols: Vec<_> = input.symbols().iter().collect();
+                for reloc in &input_section.relocations {
+                    if u32::from(reloc.r_type) != 0 || reloc.r_length != 3 {
+                        continue;
+                    }
+                    let address = section
+                        .addr
+                        .wrapping_add(member.offset)
+                        .wrapping_add(u64::from(reloc.r_address));
+                    let offset = address.wrapping_sub(segment.vmaddr);
+                    if reloc.r_extern {
+                        let Some(sym) = symbols.get(reloc.r_symbolnum as usize)
+                        else {
+                            continue;
+                        };
+                        if let Some(import) = imports.get(sym.name) {
+                            if seen_bind.insert((segment_index, offset)) {
+                                append_bind(
+                                    &mut bind,
+                                    import.dylib,
+                                    sym.name,
+                                    segment_index,
+                                    offset,
+                                );
+                            }
+                            continue;
+                        }
+                        if input_section.sectname == b"__thread_vars"
+                            && sym.name.ends_with(b"$tlv$init")
+                        {
+                            // This field is a TLS-template offset, not a
+                            // virtual address to slide.
+                            continue;
+                        }
+                        if sym.is_undefined()
+                            && sym.n_value == 0
+                            && globals.get(sym.name).is_none()
+                            && sym.n_desc & N_WEAK_REF != 0
+                        {
+                            continue;
+                        }
+                    }
+                    if seen_rebase.insert((segment_index, offset)) {
+                        rebases.push((segment_index, offset));
+                    }
+                }
+            }
+        }
+    }
+    if !bind.is_empty() {
+        bind.push(0);
+    }
+    Ok(DynamicInfo {
+        rebase: encode_rebases(&rebases),
+        bind,
+    })
+}
+
+fn append_bind(
+    out: &mut Vec<u8>,
+    dylib: u32,
+    name: &[u8],
+    segment: u8,
+    offset: u64,
+) {
+    const SET_DYLIB_ORDINAL_IMM: u8 = 0x10;
+    const SET_DYLIB_ORDINAL_ULEB: u8 = 0x20;
+    const SET_SYMBOL_TRAILING_FLAGS_IMM: u8 = 0x40;
+    const SET_TYPE_POINTER: u8 = 0x51;
+    const SET_SEGMENT_AND_OFFSET_ULEB: u8 = 0x70;
+    const DO_BIND: u8 = 0x90;
+
+    if dylib <= 15 {
+        out.push(SET_DYLIB_ORDINAL_IMM | u8::try_from(dylib).unwrap_or(15));
+    } else {
+        out.push(SET_DYLIB_ORDINAL_ULEB);
+        write_uleb(out, u64::from(dylib));
+    }
+    out.push(SET_SYMBOL_TRAILING_FLAGS_IMM);
+    out.extend_from_slice(name);
+    out.push(0);
+    out.push(SET_TYPE_POINTER);
+    out.push(SET_SEGMENT_AND_OFFSET_ULEB | segment);
+    write_uleb(out, offset);
+    out.push(DO_BIND);
+}
+
+fn encode_rebases(entries: &[(u8, u64)]) -> Vec<u8> {
+    const SET_TYPE_POINTER: u8 = 0x11;
+    const SET_SEGMENT_AND_OFFSET_ULEB: u8 = 0x20;
+    const DO_REBASE_IMM_TIMES_ONE: u8 = 0x51;
+    const DONE: u8 = 0x00;
+    let mut out = Vec::new();
+    if entries.is_empty() {
+        return out;
+    }
+    out.push(SET_TYPE_POINTER);
+    for &(segment, offset) in entries {
+        out.push(SET_SEGMENT_AND_OFFSET_ULEB | segment);
+        write_uleb(&mut out, offset);
+        out.push(DO_REBASE_IMM_TIMES_ONE);
+    }
+    out.push(DONE);
+    out
+}
+
+fn write_uleb(out: &mut Vec<u8>, mut value: u64) {
+    loop {
+        let mut byte = u8::try_from(value & 0x7f).unwrap_or(0);
+        value >>= 7;
+        if value != 0 {
+            byte |= 0x80;
+        }
+        out.push(byte);
+        if value == 0 {
+            break;
+        }
+    }
+}
+
+/// Writes arm64's three-instruction non-lazy symbol stubs:
+/// `adrp x16, slot@page; ldr x16, [x16, slot@pageoff]; br x16`.
+fn write_stubs(
+    image: &mut [u8],
+    layout: &MachLayout,
+    imports: &ImportPlan<'_>,
+    got_plan: &GotPlan<'_>,
+) -> Result<()> {
+    let Some(stubs) = layout.stubs else {
+        return Ok(());
+    };
+    let got = layout
+        .got
+        .ok_or(Error::Format("Mach-O stubs require a GOT"))?;
+    for import in imports.stubs() {
+        let stub = import.stub.unwrap_or(u32::MAX);
+        let slot = got_plan
+            .global_slot(import.name)
+            .ok_or(Error::Format("Mach-O import has no GOT slot"))?;
+        let stub_addr = stubs.addr.wrapping_add(u64::from(stub) * 12);
+        let got_addr = got.addr.wrapping_add(u64::from(slot) * 8);
+        let off = stubs.offset.wrapping_add(u64::from(stub) * 12);
+        let adrp = arm64_stub_adrp(stub_addr, got_addr)?;
+        let pageoff = u32::try_from((got_addr & 0xfff) >> 3).unwrap_or(0);
+        let ldr = 0xf940_0210 | (pageoff << 10);
+        let br = 0xd61f_0200u32;
+        let start = usize::try_from(off)
+            .map_err(|_| Error::OutOfRange("Mach-O stub offset"))?;
+        let dst = image
+            .get_mut(start..start.saturating_add(12))
+            .ok_or(Error::OutOfRange("Mach-O stub bytes"))?;
+        dst[0..4].copy_from_slice(&adrp.to_le_bytes());
+        dst[4..8].copy_from_slice(&ldr.to_le_bytes());
+        dst[8..12].copy_from_slice(&br.to_le_bytes());
+    }
+    Ok(())
+}
+
+fn arm64_stub_adrp(place: u64, target: u64) -> Result<u32> {
+    let target_page = target & !0xfff;
+    let place_page = place & !0xfff;
+    let delta = target_page
+        .cast_signed()
+        .wrapping_sub(place_page.cast_signed());
+    if !(-(1i64 << 32)..(1i64 << 32)).contains(&delta) {
+        return Err(Error::OutOfRange("arm64 stub ADRP distance"));
+    }
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let imm = (delta >> 12) as u32;
+    let imm_lo = (imm & 0x3) << 29;
+    let imm_hi = (imm & 0x001f_fffc) << 3;
+    Ok(0x9000_0010 | imm_lo | imm_hi)
 }
 
 /// Name to `__common` storage address, from the globals' merged commons and
@@ -388,16 +758,34 @@ fn intern(strtab: &mut Vec<u8>, name: &[u8]) -> u32 {
 // --- image serialisation -------------------------------------------------
 
 /// Writes the `mach_header_64` at offset zero.
-fn write_header(image: &mut [u8], target: MachoTarget, layout: &MachLayout) {
+fn write_header(
+    image: &mut [u8],
+    target: MachoTarget,
+    layout: &MachLayout,
+    options: &LinkOptions<'_>,
+) {
     let (cputype, cpusubtype) = cpu_fields(target);
     let header = MachHeader64 {
         magic: U32::new(MH_MAGIC_64),
         cputype: U32::new(cputype),
         cpusubtype: U32::new(cpusubtype),
         filetype: U32::new(MH_EXECUTE),
-        ncmds: U32::new(command_count(layout)),
+        ncmds: U32::new(command_count(layout, options)),
         sizeofcmds: U32::new(layout.sizeofcmds),
-        flags: U32::new(MH_NOUNDEFS),
+        flags: U32::new(if options.dynamic {
+            let tlv = layout.data.as_ref().is_some_and(|data| {
+                data.sections
+                    .iter()
+                    .any(|s| trim_nul(&s.sectname) == b"__thread_vars")
+            });
+            MH_NOUNDEFS
+                | MH_DYLDLINK
+                | MH_TWOLEVEL
+                | MH_PIE
+                | if tlv { MH_HAS_TLV_DESCRIPTORS } else { 0 }
+        } else {
+            MH_NOUNDEFS
+        }),
         reserved: U32::new(0),
     };
     write_pod(image, 0, &header);
@@ -418,10 +806,15 @@ fn cpu_fields(target: MachoTarget) -> (u32, u32) {
 }
 
 /// The number of load commands the image emits.
-fn command_count(layout: &MachLayout) -> u32 {
+fn command_count(layout: &MachLayout, options: &LinkOptions<'_>) -> u32 {
     // PAGEZERO, TEXT, LINKEDIT, maybe DATA.
     let nseg = 3 + u32::from(layout.data.is_some());
-    nseg + 4 // SYMTAB, DYSYMTAB, UNIXTHREAD, UUID
+    let entry = if options.dynamic { 3 } else { 1 };
+    nseg
+        + 3 // SYMTAB, DYSYMTAB, UUID
+        + entry
+        + u32::from(options.platform.is_some())
+        + u32::try_from(options.dylibs.len()).unwrap_or(u32::MAX)
 }
 
 /// Writes the load-command table right after the header.
@@ -432,6 +825,12 @@ fn write_commands(
     plan: &SymtabPlan,
     sym_addr: &[Vec<u64>],
     sec_ordinal: &[(usize, u32, u8)],
+    options: &LinkOptions<'_>,
+    rebase_relative: u64,
+    rebase_size: u32,
+    bind_relative: u64,
+    bind_size: u32,
+    stub_count: u32,
 ) -> Result<()> {
     let mut off = HEADER_SIZE;
     off = write_pagezero(image, off);
@@ -442,10 +841,165 @@ fn write_commands(
     off = write_linkedit_segment(image, off, layout);
     off = write_symtab(image, off, layout, plan);
     let got_count = layout.got.map_or(0, |g| g.count);
-    off = write_dysymtab(image, off, plan, layout, got_count)?;
-    off = write_thread(image, off, target, layout);
+    off = write_dysymtab(
+        image,
+        off,
+        plan,
+        layout,
+        got_count.saturating_add(stub_count),
+    )?;
+    if options.dynamic {
+        off = write_dyld_info(
+            image,
+            off,
+            layout,
+            rebase_relative,
+            rebase_size,
+            bind_relative,
+            bind_size,
+        );
+    }
+    if let Some(platform) = options.platform {
+        off = write_build_version(image, off, platform);
+    }
+    for dylib in options.dylibs {
+        off = write_dylib(image, off, dylib.install_name)?;
+    }
+    if options.dynamic {
+        off = write_dylinker(image, off)?;
+        off = write_main(image, off, layout);
+    } else {
+        off = write_thread(image, off, target, layout);
+    }
     write_uuid(image, off, target, layout, sym_addr, sec_ordinal);
     Ok(())
+}
+
+/// Writes `LC_BUILD_VERSION` without tool-version records.
+fn write_build_version(
+    image: &mut [u8],
+    off: u64,
+    version: crate::macho::PlatformVersion,
+) -> u64 {
+    write_pod(
+        image,
+        off,
+        &BuildVersionCommand {
+            cmd: U32::new(LC_BUILD_VERSION),
+            cmdsize: U32::new(24),
+            platform: U32::new(version.platform),
+            min_os: U32::new(version.min_os),
+            sdk: U32::new(version.sdk),
+            ntools: U32::new(0),
+        },
+    )
+}
+
+/// Writes the classic dyld metadata command. This linker uses eager non-lazy
+/// binds plus the rebase stream needed when arm64 PIE slides the image.
+fn write_dyld_info(
+    image: &mut [u8],
+    off: u64,
+    layout: &MachLayout,
+    rebase_relative: u64,
+    rebase_size: u32,
+    bind_relative: u64,
+    bind_size: u32,
+) -> u64 {
+    let rebase_off = layout.linkedit_fileoff.saturating_add(rebase_relative);
+    let bind_off = layout.linkedit_fileoff.saturating_add(bind_relative);
+    write_pod(
+        image,
+        off,
+        &DyldInfoCommand {
+            cmd: U32::new(LC_DYLD_INFO_ONLY),
+            cmdsize: U32::new(48),
+            rebase_off: U32::new(if rebase_size == 0 {
+                0
+            } else {
+                u32::try_from(rebase_off).unwrap_or(0)
+            }),
+            rebase_size: U32::new(rebase_size),
+            bind_off: U32::new(u32::try_from(bind_off).unwrap_or(0)),
+            bind_size: U32::new(bind_size),
+            weak_bind_off: U32::new(0),
+            weak_bind_size: U32::new(0),
+            lazy_bind_off: U32::new(0),
+            lazy_bind_size: U32::new(0),
+            export_off: U32::new(0),
+            export_size: U32::new(0),
+        },
+    )
+}
+
+/// Writes dyld's path for a dynamically launched executable.
+fn write_dylinker(image: &mut [u8], off: u64) -> Result<u64> {
+    const PATH: &str = "/usr/lib/dyld";
+    let size = layout::dylinker_command_size();
+    write_pod(
+        image,
+        off,
+        &DylinkerCommand {
+            cmd: U32::new(LC_LOAD_DYLINKER),
+            cmdsize: U32::new(size),
+            name: U32::new(12),
+        },
+    );
+    write_command_string(image, off, 12, size, PATH)
+}
+
+/// Writes one dynamic-library dependency by install name.
+fn write_dylib(image: &mut [u8], off: u64, name: &str) -> Result<u64> {
+    let size = layout::dylib_command_size(name);
+    write_pod(
+        image,
+        off,
+        &DylibCommand {
+            cmd: U32::new(LC_LOAD_DYLIB),
+            cmdsize: U32::new(size),
+            name: U32::new(24),
+            timestamp: U32::new(0),
+            current_version: U32::new(0),
+            compatibility_version: U32::new(0),
+        },
+    );
+    write_command_string(image, off, 24, size, name)
+}
+
+/// Copies a NUL-terminated string into an already-sized load command.
+fn write_command_string(
+    image: &mut [u8],
+    off: u64,
+    fixed_size: u32,
+    command_size: u32,
+    value: &str,
+) -> Result<u64> {
+    let start = off.saturating_add(u64::from(fixed_size));
+    let value_end =
+        start.saturating_add(u64::try_from(value.len()).unwrap_or(u64::MAX));
+    let start = usize::try_from(start)
+        .map_err(|_| Error::OutOfRange("Mach-O load-command string"))?;
+    let value_end = usize::try_from(value_end)
+        .map_err(|_| Error::OutOfRange("Mach-O load-command string"))?;
+    let slot = image
+        .get_mut(start..value_end)
+        .ok_or(Error::OutOfRange("Mach-O load-command string"))?;
+    slot.copy_from_slice(value.as_bytes());
+    Ok(off.saturating_add(u64::from(command_size)))
+}
+
+/// Writes `LC_MAIN`, whose entry offset is relative to `__TEXT`.
+fn write_main(image: &mut [u8], off: u64, layout: &MachLayout) -> u64 {
+    write_pod(
+        image,
+        off,
+        &EntryPointCommand {
+            cmd: U32::new(LC_MAIN),
+            cmdsize: U32::new(24),
+            entryoff: U64::new(layout.entry_off),
+            stacksize: U64::new(0),
+        },
+    )
 }
 
 /// Writes one `LC_SEGMENT_64` and its embedded `section_64` headers.
@@ -477,8 +1031,8 @@ fn write_segment(image: &mut [u8], off: u64, seg: &OutSegment) -> Result<u64> {
             reloff: U32::new(0),
             nreloc: U32::new(0),
             flags: U32::new(s.flags),
-            reserved1: U32::new(0),
-            reserved2: U32::new(0),
+            reserved1: U32::new(s.reserved1),
+            reserved2: U32::new(s.reserved2),
             reserved3: U32::new(0),
         };
         cursor = write_pod(image, cursor, &hdr);
@@ -721,6 +1275,11 @@ fn write_linkedit(
     sym_addr: &[Vec<u64>],
     sec_ordinal: &[(usize, u32, u8)],
     got_plan: &GotPlan<'_>,
+    imports: &ImportPlan<'_>,
+    rebase_relative: u64,
+    rebase: &[u8],
+    bind_relative: u64,
+    bind: &[u8],
 ) {
     let common_sect = common_section_ordinal(layout);
     let mut off = layout.linkedit_fileoff;
@@ -759,7 +1318,19 @@ fn write_linkedit(
         usize::try_from(ind_off).unwrap_or(usize::MAX),
         plan,
         got_plan,
+        imports,
     );
+    let rebase_off = layout.linkedit_fileoff.saturating_add(rebase_relative);
+    let start = usize::try_from(rebase_off).unwrap_or(usize::MAX);
+    if let Some(dst) = image.get_mut(start..start.saturating_add(rebase.len()))
+    {
+        dst.copy_from_slice(rebase);
+    }
+    let bind_off = layout.linkedit_fileoff.saturating_add(bind_relative);
+    let start = usize::try_from(bind_off).unwrap_or(usize::MAX);
+    if let Some(dst) = image.get_mut(start..start.saturating_add(bind.len())) {
+        dst.copy_from_slice(bind);
+    }
 }
 
 /// Writes the indirect symbol table after the string table: for each
@@ -771,7 +1342,22 @@ fn write_indirect_symbols(
     off: usize,
     plan: &SymtabPlan<'_>,
     got_plan: &GotPlan<'_>,
+    imports: &ImportPlan<'_>,
 ) {
+    for import in imports.stubs() {
+        let stub = import.stub.unwrap_or(u32::MAX);
+        let row = plan
+            .by_name
+            .get(import.name)
+            .copied()
+            .unwrap_or(INDIRECT_SYMBOL_ABS);
+        let at =
+            off.saturating_add(usize::try_from(stub).unwrap_or(usize::MAX) * 4);
+        if let Some(dst) = image.get_mut(at..at.saturating_add(4)) {
+            dst.copy_from_slice(&row.to_le_bytes());
+        }
+    }
+    let got_base = imports.stub_count();
     for (slot, key) in got_plan.iter() {
         let row = match key {
             GotKey::Global(name) => plan
@@ -785,8 +1371,10 @@ fn write_indirect_symbols(
                 .copied()
                 .unwrap_or(INDIRECT_SYMBOL_LOCAL),
         };
-        let at =
-            off.saturating_add(usize::try_from(slot).unwrap_or(usize::MAX) * 4);
+        let row_index = got_base.saturating_add(slot);
+        let at = off.saturating_add(
+            usize::try_from(row_index).unwrap_or(usize::MAX) * 4,
+        );
         if let Some(dst) = image.get_mut(at..at.saturating_add(4)) {
             dst.copy_from_slice(&row.to_le_bytes());
         }
@@ -910,6 +1498,84 @@ fn write_sections(
         in_addr: &in_addr,
     };
     sections::write(image, inputs, target, layout, &tables)
+}
+
+/// Rewrites the third word of each Darwin TLV descriptor. Object files spell
+/// it as a relocation to `$tlv$init`; final images store an offset from the
+/// start of the thread-local template, which `_tlv_bootstrap` consumes.
+fn write_tls_descriptors(
+    image: &mut [u8],
+    inputs: &[MachOFile<'_>],
+    layout: &MachLayout,
+    sym_addr: &[Vec<u64>],
+) -> Result<()> {
+    let Some(data) = layout.data.as_ref() else {
+        return Ok(());
+    };
+    let tls_base = data
+        .sections
+        .iter()
+        .find(|s| trim_nul(&s.sectname) == b"__thread_data")
+        .or_else(|| {
+            data.sections
+                .iter()
+                .find(|s| trim_nul(&s.sectname) == b"__thread_bss")
+        })
+        .map(|s| s.addr);
+    let Some(tls_base) = tls_base else {
+        return Ok(());
+    };
+    let Some(vars) = data
+        .sections
+        .iter()
+        .find(|s| trim_nul(&s.sectname) == b"__thread_vars")
+    else {
+        return Ok(());
+    };
+    for member in &vars.members {
+        let input = inputs
+            .get(member.file)
+            .ok_or(Error::OutOfRange("TLV descriptor input"))?;
+        let section = input
+            .sections()
+            .into_iter()
+            .find(|s| s.index == member.section)
+            .ok_or(Error::OutOfRange("TLV descriptor section"))?;
+        let symbols: Vec<_> = input.symbols().iter().collect();
+        for reloc in &section.relocations {
+            if !reloc.r_extern
+                || u32::from(reloc.r_type) != 0
+                || reloc.r_length != 3
+            {
+                continue;
+            }
+            let Some(sym) = symbols.get(reloc.r_symbolnum as usize) else {
+                continue;
+            };
+            if !sym.name.ends_with(b"$tlv$init") {
+                continue;
+            }
+            let address = sym_addr
+                .get(member.file)
+                .and_then(|file| file.get(reloc.r_symbolnum as usize))
+                .copied()
+                .ok_or(Error::OutOfRange("TLV initializer symbol"))?;
+            let value = address
+                .checked_sub(tls_base)
+                .ok_or(Error::Format("TLV initializer precedes template"))?;
+            let off = vars
+                .offset
+                .wrapping_add(member.offset)
+                .wrapping_add(u64::from(reloc.r_address));
+            let start = usize::try_from(off)
+                .map_err(|_| Error::OutOfRange("TLV descriptor offset"))?;
+            let dst = image
+                .get_mut(start..start.saturating_add(8))
+                .ok_or(Error::OutOfRange("TLV descriptor bytes"))?;
+            dst.copy_from_slice(&value.to_le_bytes());
+        }
+    }
+    Ok(())
 }
 
 /// Per file, per 1-based section ordinal: the address the input file gave that

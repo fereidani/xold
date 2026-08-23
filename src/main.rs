@@ -37,7 +37,7 @@ use xold::{
     icf::IcfMode,
     input::{Format, Input},
     linker::{Link, link_image},
-    macho::link_macho,
+    macho::{Dylib, LinkOptions as MachOLinkOptions, link_macho_with_options},
     script::{self, Search},
     startlib,
     versionscript::{self, VersionScript},
@@ -85,7 +85,10 @@ fn main() -> ExitCode {
 /// off the caller's clock. mold and wild do the same by default;
 /// `--no-fork` keeps the link in this process.
 fn link_detached(opts: &Options) -> ExitCode {
-    if !opts.no_fork {
+    // A dynamic Mach-O link is ad-hoc signed after the writer publishes it.
+    // Keep that final mutation in the foreground so clang never observes the
+    // pre-signature image released by `write_output`.
+    if !opts.no_fork && !opts.macho_dynamic {
         xold::detach::fork_child();
     }
     match with_threads(opts, || run(opts)) {
@@ -129,7 +132,27 @@ fn run(opts: &Options) -> Result<()> {
             return Err(unsupported("-shared".into(), "Mach-O"));
         }
         let entry = default_entry(opts, b"_main");
-        return link_macho(&files, &opts.output, entry);
+        let dylibs: Vec<Dylib<'_>> = list
+            .dylibs
+            .iter()
+            .map(|dylib| Dylib {
+                install_name: &dylib.install_name,
+                exports: &dylib.exports,
+            })
+            .collect();
+        link_macho_with_options(
+            &files,
+            &opts.output,
+            entry,
+            &MachOLinkOptions {
+                arch: opts.macho_arch,
+                dynamic: opts.macho_dynamic,
+                platform: opts.macho_platform,
+                dead_strip: opts.macho_dead_strip,
+                dylibs: &dylibs,
+            },
+        )?;
+        return ad_hoc_sign(&opts.output);
     }
     // COFF inputs (Windows objects) take a separate link path that produces a
     // PE32+ image; the ELF linker cannot consume them. Windows C programs
@@ -358,6 +381,16 @@ struct Resolved {
 struct InputList {
     files: Vec<Entry>,
     scan: InputScan,
+    /// Install names read from Darwin `.tbd` stubs, in command-line order.
+    /// Aliases such as `libc.tbd` and `libm.tbd` commonly name libSystem, so
+    /// duplicates are removed as they are collected.
+    dylibs: Vec<DylibInput>,
+}
+
+/// One dynamic library collected from a TAPI stub or a direct `.dylib`.
+struct DylibInput {
+    install_name: String,
+    exports: Vec<String>,
 }
 
 impl InputList {
@@ -422,6 +455,46 @@ impl InputList {
         search: &Search<'_>,
         depth: usize,
     ) -> Result<()> {
+        if file.path.extension().and_then(|ext| ext.to_str()) == Some("dylib") {
+            let install_name = search
+                .sysroot
+                .and_then(|root| file.path.strip_prefix(root).ok())
+                .map_or_else(
+                    || file.path.to_string_lossy().into_owned(),
+                    |path| format!("/{}", path.display()),
+                );
+            if !self
+                .dylibs
+                .iter()
+                .any(|dylib| dylib.install_name == install_name)
+            {
+                self.dylibs.push(DylibInput {
+                    install_name,
+                    exports: Vec::new(),
+                });
+            }
+            return Ok(());
+        }
+        if file.path.extension().and_then(|ext| ext.to_str()) == Some("tbd") {
+            let stub = xold::macho::tapi::parse(&std::fs::read_to_string(
+                &file.path,
+            )?)?;
+            if let Some(existing) = self
+                .dylibs
+                .iter_mut()
+                .find(|dylib| dylib.install_name == stub.install_name)
+            {
+                existing.exports.extend(stub.exports);
+                existing.exports.sort_unstable();
+                existing.exports.dedup();
+            } else {
+                self.dylibs.push(DylibInput {
+                    install_name: stub.install_name,
+                    exports: stub.exports,
+                });
+            }
+            return Ok(());
+        }
         let mut buf = [0u8; HEAD_LEN];
         let head = read_head(&file.path, &mut buf)
             .and_then(|n| buf.get(..n))
@@ -502,6 +575,27 @@ impl InputList {
         }
         Ok(())
     }
+}
+
+/// Ad-hoc signs a dynamic Mach-O executable on macOS. Apple Silicon's kernel
+/// validates every executable mapping; leaving the signature to a later tool
+/// makes a successfully linked image die with SIGKILL before dyld can start.
+fn ad_hoc_sign(path: &Path) -> Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        let status = std::process::Command::new("/usr/bin/codesign")
+            .args(["--force", "--sign", "-"])
+            .arg(path)
+            .status()?;
+        if !status.success() {
+            return Err(Error::CommandLine(format!(
+                "ad-hoc codesigning failed for {}",
+                path.display()
+            )));
+        }
+    }
+    let _ = path;
+    Ok(())
 }
 
 /// Fills `head` from the start of `path`, returning how many bytes were read.

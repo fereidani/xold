@@ -21,8 +21,9 @@
 //! addend, folded in when the reloc array is walked. At the spec level it is
 //! [`RelExpr::None`] since it emits nothing at its own site.
 //!
-//! TLS (`TLVP`) is recognised but routed to [`Escape`] and rejected until the
-//! TLS models land.
+//! Darwin TLV (`TLVP`) references address the compiler-emitted descriptor in
+//! `__thread_vars`; the instruction pair is the same page/pageoff load shape
+//! as a GOT reference, but resolves against the descriptor symbol itself.
 //!
 //! [`Escape`]: crate::reloc::RelExpr::Escape
 
@@ -150,11 +151,37 @@ impl Arch for MachoArm64 {
                 let got = RelExpr::Got.compute(sym, addend, 0, resolver)?;
                 write_pageoff12(out, got)
             }
+            ARM64_RELOC_TLVP_LOAD_PAGE21 => {
+                let descriptor =
+                    RelExpr::Abs.compute(sym, addend, 0, resolver)?;
+                write_adr(out, page_delta(descriptor, place))
+            }
+            ARM64_RELOC_TLVP_LOAD_PAGEOFF12 => {
+                let descriptor =
+                    RelExpr::Abs.compute(sym, addend, 0, resolver)?;
+                write_tlvp_pageoff12(out, descriptor)
+            }
             // SUBTRACTOR pairs and TLS relocations are recognised but not
             // reduced in this phase.
             _ => Err(Error::UnsupportedReloc(r_type)),
         }
     }
+}
+
+/// A local TLV does not need a pointer section: relax the compiler's
+/// `ldr Xt, [Xn, descriptor@TLVPPAGEOFF]` into
+/// `add Xt, Xn, descriptor@PAGEOFF`, producing the descriptor address that
+/// the following indirect call expects.
+fn write_tlvp_pageoff12(out: &mut [u8], va: u64) -> Result<()> {
+    if out.len() != 4 {
+        return Err(Error::OutOfRange("TLVP PAGEOFF12 relocation slot"));
+    }
+    let cell = u32::from_le_bytes([out[0], out[1], out[2], out[3]]);
+    let registers = cell & 0x3ff;
+    let imm = u32::try_from(va & 0xfff).unwrap_or(0);
+    let patched = 0x9100_0000 | registers | (imm << 10);
+    out.copy_from_slice(&patched.to_le_bytes());
+    Ok(())
 }
 
 /// The signed byte distance from the page holding `place` to the page holding

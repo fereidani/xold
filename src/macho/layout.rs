@@ -16,11 +16,12 @@
 use crate::{
     error::{Error, Result},
     macho::{
-        MachOFile, MachSection,
+        LinkOptions, MachOFile, MachSection,
         constants::{
-            ARM_THREAD_STATE64_COUNT, S_NON_LAZY_SYMBOL_POINTERS, S_ZEROFILL,
-            SECTION_TYPE, VM_PROT_EXECUTE, VM_PROT_READ,
-            X86_THREAD_STATE64_COUNT,
+            ARM_THREAD_STATE64_COUNT, S_ATTR_PURE_INSTRUCTIONS,
+            S_ATTR_SOME_INSTRUCTIONS, S_NON_LAZY_SYMBOL_POINTERS,
+            S_SYMBOL_STUBS, S_THREAD_LOCAL_ZEROFILL, S_ZEROFILL, SECTION_TYPE,
+            VM_PROT_EXECUTE, VM_PROT_READ, X86_THREAD_STATE64_COUNT,
         },
         reloc::MachoTarget,
         symtab::CommonSym,
@@ -35,6 +36,10 @@ pub const TEXT_BASE: u64 = 0x1_0000_0000;
 pub const FILE_PAGE: u64 = 0x4000;
 /// On-disk size of `mach_header_64`.
 pub const HEADER_SIZE: u64 = 32;
+/// Free bytes between the load commands and the first section. `codesign`
+/// inserts `LC_CODE_SIGNATURE` after the link, growing `sizeofcmds` by 16;
+/// without header padding that command overwrites the first instructions.
+const HEADER_PAD: u64 = 32;
 
 /// One member input section selected for linking.
 #[derive(Clone, Copy)]
@@ -61,6 +66,10 @@ pub struct OutSection {
     pub size: u64,
     /// `S_ZEROFILL`: occupies virtual space but no file bytes.
     pub zerofill: bool,
+    /// Indirect-symbol-table start index for stubs and pointer sections.
+    pub reserved1: u32,
+    /// Fixed stub size for `S_SYMBOL_STUBS`.
+    pub reserved2: u32,
 }
 
 /// A placed output segment and its sections (file-backed first, zero-fill
@@ -89,6 +98,14 @@ pub struct GotLayout {
     pub count: u32,
 }
 
+/// The placed synthetic arm64 `__stubs` section.
+#[derive(Clone, Copy)]
+pub struct StubLayout {
+    pub addr: u64,
+    pub offset: u64,
+    pub count: u32,
+}
+
 /// The laid-out Mach-O image: segments, the `__LINKEDIT` extent, the load
 /// command table size, and per-input-section virtual addresses.
 pub struct MachLayout {
@@ -104,6 +121,7 @@ pub struct MachLayout {
     pub sec_vaddr: Vec<Vec<u64>>,
     /// The placed `__got` section, if any GOT entries were allocated.
     pub got: Option<GotLayout>,
+    pub stubs: Option<StubLayout>,
     /// The virtual address of each merged common symbol, parallel to the
     /// `commons` list handed to [`build`].
     pub common_addr: Vec<u64>,
@@ -124,12 +142,17 @@ pub fn build(
     got_count: u32,
     commons: &[CommonSym<'_>],
     target: MachoTarget,
+    options: &LinkOptions<'_>,
+    stub_count: u32,
 ) -> Result<MachLayout> {
     let mut text_secs = Vec::new();
     let mut data_secs = Vec::new();
     collect_sections(inputs, &mut text_secs, &mut data_secs);
+    if stub_count > 0 {
+        inject_stubs(&mut text_secs, stub_count);
+    }
     if got_count > 0 {
-        inject_got_section(&mut data_secs, got_count);
+        inject_got_section(&mut data_secs, got_count, stub_count);
     }
     if !commons.is_empty() {
         inject_common_section(&mut data_secs, commons);
@@ -139,7 +162,7 @@ pub fn build(
         .map_err(|_| Error::OutOfRange("text section count"))?;
     let nsects_data = u32::try_from(data_secs.len())
         .map_err(|_| Error::OutOfRange("data section count"))?;
-    let sizeofcmds = commands_size(nsects_text, nsects_data, target);
+    let sizeofcmds = commands_size(nsects_text, nsects_data, target, options);
 
     let text = place_text_segment(text_secs, sizeofcmds);
     let data = place_data_segment(data_secs, &text);
@@ -154,6 +177,7 @@ pub fn build(
 
     let entry_off = entry_offset(inputs, &sec_vaddr, entry)?;
     let got = find_got(data.as_ref());
+    let stubs = find_stubs(&text);
     let common_addr = common_addresses(data.as_ref(), commons);
     Ok(MachLayout {
         text,
@@ -165,6 +189,7 @@ pub fn build(
         entry_off,
         sec_vaddr,
         got,
+        stubs,
         common_addr,
     })
 }
@@ -173,7 +198,11 @@ pub fn build(
 /// pointer table (`S_NON_LAZY_SYMBOL_POINTERS`), 8-byte aligned, one slot per
 /// referenced symbol. It carries no input members: the writer fills its bytes
 /// directly from the resolved symbol addresses.
-fn inject_got_section(data_secs: &mut Vec<OutSection>, got_count: u32) {
+fn inject_got_section(
+    data_secs: &mut Vec<OutSection>,
+    got_count: u32,
+    stub_count: u32,
+) {
     let size = u64::from(got_count).checked_mul(8).unwrap_or(0);
     data_secs.insert(
         0,
@@ -187,8 +216,29 @@ fn inject_got_section(data_secs: &mut Vec<OutSection>, got_count: u32) {
             offset: 0,
             size,
             zerofill: false,
+            reserved1: stub_count,
+            reserved2: 0,
         },
     );
+}
+
+/// Appends one 12-byte arm64 stub per imported function.
+fn inject_stubs(text_secs: &mut Vec<OutSection>, stub_count: u32) {
+    text_secs.push(OutSection {
+        segname: pad_name(b"__TEXT"),
+        sectname: pad_name(b"__stubs"),
+        flags: S_SYMBOL_STUBS
+            | S_ATTR_PURE_INSTRUCTIONS
+            | S_ATTR_SOME_INSTRUCTIONS,
+        align: 2,
+        members: Vec::new(),
+        addr: 0,
+        offset: 0,
+        size: u64::from(stub_count).saturating_mul(12),
+        zerofill: false,
+        reserved1: 0,
+        reserved2: 12,
+    });
 }
 
 /// Locates the placed `__got` section in `__DATA` and reports its address,
@@ -204,6 +254,18 @@ fn find_got(data: Option<&OutSegment>) -> Option<GotLayout> {
         addr: got.addr,
         offset: got.offset,
         count,
+    })
+}
+
+fn find_stubs(text: &OutSegment) -> Option<StubLayout> {
+    let stubs = text
+        .sections
+        .iter()
+        .find(|s| trim_nul(&s.sectname) == b"__stubs")?;
+    Some(StubLayout {
+        addr: stubs.addr,
+        offset: stubs.offset,
+        count: u32::try_from(stubs.size / 12).unwrap_or(0),
     })
 }
 
@@ -233,6 +295,8 @@ fn inject_common_section(
         offset: 0,
         size,
         zerofill: true,
+        reserved1: 0,
+        reserved2: 0,
     });
 }
 
@@ -271,6 +335,7 @@ fn commands_size(
     nsects_text: u32,
     nsects_data: u32,
     target: MachoTarget,
+    options: &LinkOptions<'_>,
 ) -> u32 {
     let seg_text = 72 + 80 * nsects_text;
     let seg_data = if nsects_data > 0 {
@@ -278,10 +343,36 @@ fn commands_size(
     } else {
         0
     };
-    // __PAGEZERO + __LINKEDIT segments, LC_SYMTAB, LC_DYSYMTAB,
-    // LC_UNIXTHREAD, LC_UUID.
-    let trailing = 72 + 72 + 24 + 80 + thread_command_size(target) + 24;
+    // __PAGEZERO + __LINKEDIT segments, LC_SYMTAB, LC_DYSYMTAB, LC_UUID.
+    let base = 72 + 72 + 24 + 80 + 24;
+    let entry = if options.dynamic {
+        // LC_DYLD_INFO_ONLY + LC_LOAD_DYLINKER + LC_MAIN.
+        48 + dylinker_command_size() + 24
+    } else {
+        thread_command_size(target)
+    };
+    let platform = 24 * u32::from(options.platform.is_some());
+    let dylibs = options.dylibs.iter().fold(0u32, |sum, name| {
+        sum.saturating_add(dylib_command_size(name.install_name))
+    });
+    let trailing = base + entry + platform + dylibs;
     seg_text + seg_data + trailing
+}
+
+/// Size of `LC_LOAD_DYLINKER` with `/usr/lib/dyld`, 8-byte aligned.
+pub const fn dylinker_command_size() -> u32 {
+    align_command(12 + 14)
+}
+
+/// Size of one `LC_LOAD_DYLIB` including its install name.
+pub fn dylib_command_size(name: &str) -> u32 {
+    let name_len = u32::try_from(name.len()).unwrap_or(u32::MAX);
+    align_command(24u32.saturating_add(name_len).saturating_add(1))
+}
+
+/// Mach-O load commands in a 64-bit image are padded to eight bytes.
+const fn align_command(size: u32) -> u32 {
+    size.saturating_add(7) & !7
 }
 
 /// The byte size of the `LC_UNIXTHREAD` command for `target`: the four header
@@ -301,8 +392,9 @@ fn place_text_segment(
     sizeofcmds: u32,
 ) -> OutSegment {
     order_sections(&mut sections);
-    let mut cursor = HEADER_SIZE + u64::from(sizeofcmds);
-    let mut vcursor = TEXT_BASE + HEADER_SIZE + u64::from(sizeofcmds);
+    let first_section = HEADER_SIZE + u64::from(sizeofcmds) + HEADER_PAD;
+    let mut cursor = first_section;
+    let mut vcursor = TEXT_BASE + first_section;
     for s in &mut sections {
         let a = u64::from(1u32.checked_shl(s.align).unwrap_or(1));
         cursor = align_up(cursor, a);
@@ -312,7 +404,10 @@ fn place_text_segment(
         cursor += s.size;
         vcursor += s.size;
     }
-    let filesize = cursor;
+    // Darwin maps executable/data segments in whole pages. A short segment
+    // command that ended at the last section was structurally readable but
+    // rejected as a bad executable by dyld.
+    let filesize = align_up(cursor, FILE_PAGE);
     OutSegment {
         name: pad_name(b"__TEXT"),
         vmaddr: TEXT_BASE,
@@ -364,9 +459,9 @@ fn place_data_segment(
     Some(OutSegment {
         name: pad_name(b"__DATA"),
         vmaddr,
-        vmsize: last_vm_end.wrapping_sub(vmaddr),
+        vmsize: align_up(last_vm_end.wrapping_sub(vmaddr), FILE_PAGE),
         fileoff,
-        filesize: last_file_end.wrapping_sub(fileoff),
+        filesize: align_up(last_file_end.wrapping_sub(fileoff), FILE_PAGE),
         maxprot: VM_PROT_READ | crate::macho::constants::VM_PROT_WRITE,
         initprot: VM_PROT_READ | crate::macho::constants::VM_PROT_WRITE,
         sections,
@@ -392,7 +487,18 @@ fn linkedit_extents(
 /// insertion order within each group. A real darwin link orders by section
 /// type; this grouping is enough to keep the file extent contiguous.
 fn order_sections(sections: &mut [OutSection]) {
-    sections.sort_by_key(|s| s.zerofill);
+    sections.sort_by_key(|s| {
+        let name = trim_nul(&s.sectname);
+        if s.zerofill {
+            3
+        } else if name == b"__thread_vars" {
+            1
+        } else if name == b"__thread_data" {
+            2
+        } else {
+            0
+        }
+    });
 }
 
 /// Records every placed member's base virtual address in the per-input map:
@@ -487,15 +593,20 @@ fn add_member(
     let out = bucket
         .iter_mut()
         .find(|s| (s.segname_for_cmp(), s.sectname_for_cmp()) == key);
+    let section_align = if section.sectname == b"__thread_vars" {
+        section.align.max(3)
+    } else {
+        section.align
+    };
     let member = Member {
         file,
         section: section.index,
         size: section.size,
-        align: section.align,
+        align: section_align,
         offset: 0,
     };
     if let Some(out) = out {
-        out.align = out.align.max(section.align);
+        out.align = out.align.max(section_align);
         out.members.push(member);
         return;
     }
@@ -503,12 +614,17 @@ fn add_member(
         segname: pad_name(section.segname),
         sectname: pad_name(section.sectname),
         flags: section.flags,
-        align: section.align,
+        align: section_align,
         members: vec![member],
         addr: 0,
         offset: 0,
         size: 0,
-        zerofill: section.flags & SECTION_TYPE == S_ZEROFILL,
+        zerofill: matches!(
+            section.flags & SECTION_TYPE,
+            S_ZEROFILL | S_THREAD_LOCAL_ZEROFILL
+        ),
+        reserved1: 0,
+        reserved2: 0,
     });
 }
 

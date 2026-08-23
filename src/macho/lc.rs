@@ -177,6 +177,59 @@ pub struct EntryPointCommand {
     pub stacksize: U64,
 }
 
+/// `dylinker_command`, followed by its NUL-terminated path.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+pub struct DylinkerCommand {
+    pub cmd: U32,
+    pub cmdsize: U32,
+    /// Byte offset of the path from the start of this command.
+    pub name: U32,
+}
+
+/// `dylib_command`, followed by its NUL-terminated install name.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+pub struct DylibCommand {
+    pub cmd: U32,
+    pub cmdsize: U32,
+    /// Byte offset of the install name from the command start.
+    pub name: U32,
+    pub timestamp: U32,
+    pub current_version: U32,
+    pub compatibility_version: U32,
+}
+
+/// `build_version_command` without tool records.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+pub struct BuildVersionCommand {
+    pub cmd: U32,
+    pub cmdsize: U32,
+    pub platform: U32,
+    pub min_os: U32,
+    pub sdk: U32,
+    pub ntools: U32,
+}
+
+/// `dyld_info_command`: offsets and sizes of classic dyld opcode streams.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+pub struct DyldInfoCommand {
+    pub cmd: U32,
+    pub cmdsize: U32,
+    pub rebase_off: U32,
+    pub rebase_size: U32,
+    pub bind_off: U32,
+    pub bind_size: U32,
+    pub weak_bind_off: U32,
+    pub weak_bind_size: U32,
+    pub lazy_bind_off: U32,
+    pub lazy_bind_size: U32,
+    pub export_off: U32,
+    pub export_size: U32,
+}
+
 /// `thread_command` header, 16 bytes, followed by `count` 32-bit words of
 /// register state.
 ///

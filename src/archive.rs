@@ -4,7 +4,8 @@
 //! static libraries on demand. This module parses the GNU symbol index (the `/`
 //! member) of an archive into a name-to-member map and lets the driver fetch a
 //! member's bytes by header offset. Both the fat layout and the thin one are
-//! read; BSD `#1/` embedded names are not.
+//! read. BSD `#1/` embedded names are also exposed by [`members`], which the
+//! Mach-O driver uses for Rust's Darwin `.rlib` archives.
 
 use std::{
     borrow::Cow,
@@ -243,6 +244,69 @@ impl<'data> Archive<'data> {
         let name = &rest[..end];
         Ok(name.strip_suffix(b"/").unwrap_or(name))
     }
+}
+
+/// Returns every regular member stored inside a fat archive, in archive
+/// order. Metadata and symbol-index members are omitted; BSD `#1/N` names are
+/// removed from the returned payload.
+///
+/// This is deliberately an eager enumeration primitive rather than archive
+/// resolution policy. The ELF linker continues to use [`Archive::lookup`]
+/// for lazy extraction; the Mach-O backend currently has no archive symbol
+/// graph and uses this to admit Rust `.rlib` inputs at all.
+pub fn members(bytes: &[u8]) -> Result<Vec<&[u8]>> {
+    if bytes.starts_with(THIN_MAGIC) {
+        return Err(Error::Format(
+            "thin archives are not supported by the Mach-O linker",
+        ));
+    }
+    if !bytes.starts_with(ARCHIVE_MAGIC) {
+        return Err(Error::Format("not an ar archive"));
+    }
+    let mut out = Vec::new();
+    let mut pos = ARCHIVE_MAGIC.len();
+    while let Some(hdr) = read_header(bytes, pos, false)? {
+        if matches!(hdr.kind, MemberKind::Regular) {
+            let field = bytes
+                .get(pos..pos + NAME_FIELD)
+                .ok_or(Error::OutOfRange("archive member name"))?;
+            let data = member_data(bytes, &hdr)?;
+            let (name, payload) = bsd_member(field, data)?;
+            let metadata = name.is_some_and(|name| {
+                name.starts_with(b"__.SYMDEF")
+                    || name == b"lib.rmeta"
+                    || name == b"lib.rmeta-link"
+            });
+            if !metadata {
+                out.push(payload);
+            }
+        }
+        pos = hdr.next;
+    }
+    Ok(out)
+}
+
+/// Splits BSD's `#1/N` embedded filename from a member payload.
+fn bsd_member<'a>(
+    field: &'a [u8],
+    data: &'a [u8],
+) -> Result<(Option<&'a [u8]>, &'a [u8])> {
+    let raw = trim_blank(field);
+    let Some(digits) = raw.strip_prefix(b"#1/") else {
+        return Ok((short_name(field), data));
+    };
+    let name_len = std::str::from_utf8(digits)
+        .ok()
+        .and_then(|n| n.parse::<usize>().ok())
+        .ok_or(Error::Format("BSD archive member name length"))?;
+    let name = data
+        .get(..name_len)
+        .ok_or(Error::OutOfRange("BSD archive member name"))?;
+    let payload = data
+        .get(name_len..)
+        .ok_or(Error::OutOfRange("BSD archive member data"))?;
+    let end = name.iter().position(|&b| b == 0).unwrap_or(name.len());
+    Ok((Some(&name[..end]), payload))
 }
 
 /// Rebuilds the index from the members themselves, for an archive that

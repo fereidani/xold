@@ -318,7 +318,7 @@ fn arm64_got_load_page21_writes_page_offset_of_got_entry() {
 }
 
 #[test]
-fn arm64_subtractor_and_tls_escape_is_rejected() {
+fn arm64_subtractor_escape_is_rejected() {
     let fixed = Fixed {
         symbol: 0,
         got: 0,
@@ -326,18 +326,34 @@ fn arm64_subtractor_and_tls_escape_is_rejected() {
         got_base: 0,
     };
     let mut slot = [0u8; 4];
-    for ty in [ARM64_RELOC_SUBTRACTOR, ARM64_RELOC_TLVP_LOAD_PAGE21] {
-        let err = apply::<MachoArm64, _>(
-            ty,
-            Some(SymbolId(1)),
-            0,
-            0,
-            &fixed,
-            &mut slot,
-        )
-        .unwrap_err();
-        assert!(matches!(err, xold::Error::UnsupportedReloc(t) if t == ty));
-    }
+    let ty = ARM64_RELOC_SUBTRACTOR;
+    let err =
+        apply::<MachoArm64, _>(ty, Some(SymbolId(1)), 0, 0, &fixed, &mut slot)
+            .unwrap_err();
+    assert!(matches!(err, xold::Error::UnsupportedReloc(t) if t == ty));
+}
+
+#[test]
+fn arm64_tlvp_load_page21_writes_page_offset_of_descriptor() {
+    let fixed = Fixed {
+        symbol: 0x9000,
+        got: 0,
+        plt: 0,
+        got_base: 0,
+    };
+    // page(descriptor) - page(P) = 0x5000; >> 12 = 0x5, same split encoding
+    // as PAGE21: the descriptor lives at the symbol's own address.
+    let mut slot = ADRP;
+    apply::<MachoArm64, _>(
+        ARM64_RELOC_TLVP_LOAD_PAGE21,
+        Some(SymbolId(1)),
+        0,
+        0x4000,
+        &fixed,
+        &mut slot,
+    )
+    .unwrap();
+    assert_eq!(slot, [0x20, 0x00, 0x00, 0xB0]);
 }
 
 #[test]

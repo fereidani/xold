@@ -142,8 +142,8 @@ impl Drop for OutputFile {
     }
 }
 
-/// Reserves the file's blocks up front, so a full disk is an error rather than
-/// a signal.
+/// On Linux, reserves the file's blocks up front, so a full disk is an error
+/// rather than a signal.
 ///
 /// `set_len` makes a sparse file: the blocks are allocated when the pages
 /// fault in during writing, and a failed allocation there kills the process
@@ -163,7 +163,7 @@ impl Drop for OutputFile {
 /// the up-front `ENOSPC` report that the memory filesystem could not honour
 /// meaningfully anyway (pages appear on write, not on reservation, whenever
 /// the mapping outlives a concurrent consumer of the same memory).
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn reserve_blocks(file: &File, size: u64) -> Result<()> {
     use std::os::fd::AsRawFd;
     let Ok(len) = i64::try_from(size) else {
@@ -185,7 +185,7 @@ fn reserve_blocks(file: &File, size: u64) -> Result<()> {
 /// Whether `file` lives on tmpfs, where preallocation populates pages
 /// instead of reserving extents. A failed `fstatfs` answers no, keeping the
 /// reservation and its error report.
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn on_tmpfs(file: &File) -> bool {
     use std::{mem::MaybeUninit, os::fd::AsRawFd};
     let mut buf = MaybeUninit::<libc::statfs>::uninit();
@@ -201,7 +201,9 @@ fn on_tmpfs(file: &File) -> bool {
 }
 
 /// Filesystems this linker cannot preallocate on keep the sparse file.
-#[cfg(not(unix))]
+// `Result` so both definitions present one signature to the caller.
+#[allow(clippy::unnecessary_wraps)]
+#[cfg(not(target_os = "linux"))]
 fn reserve_blocks(_file: &File, _size: u64) -> Result<()> {
     Ok(())
 }
@@ -230,12 +232,13 @@ impl OutputFile {
             // carrying its process id, so nothing else is writing to it for
             // the duration of the link.
             let map = unsafe { memmap2::MmapMut::map_mut(&file)? };
-            // A writable mapping of a file makes it unexecutable while it
-            // lives, and a fork inherits it. Without this, a caller that links
-            // on one thread while spawning a process on another hands the
-            // child a mapping it keeps until it execs, and any attempt to run
-            // the image in that window fails with `ETXTBSY`. Advice the kernel
-            // may decline is not worth failing the link over.
+            // On Linux, a writable mapping of a file makes it unexecutable
+            // while it lives, and a fork inherits it. Without this, a caller
+            // that links on one thread while spawning a process on another
+            // hands the child a mapping it keeps until it execs, and any
+            // attempt to run the image in that window fails with `ETXTBSY`.
+            // Advice the kernel may decline is not worth failing the link over.
+            #[cfg(target_os = "linux")]
             let _ = map.advise(memmap2::Advice::DontFork);
             Some(map)
         };

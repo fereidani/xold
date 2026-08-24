@@ -424,6 +424,11 @@ fn dlopen_resolves_exports_and_a_missing_lookup_fails() {
     compile(SHARED_SRC, &obj, true).expect("host clang compiles -fPIC");
     link_shared_with_xold(&obj, &so, b"libgh.so");
 
+    if !cfg!(target_os = "linux") {
+        assert_loader_lookup_contract(&so);
+        return;
+    }
+
     let harness_src = b"#include <dlfcn.h>\n\
         int extern_sym(void) { return 11; }\n\
         int main(void) {\n\
@@ -467,6 +472,87 @@ fn dlopen_resolves_exports_and_a_missing_lookup_fails() {
         status.success(),
         "dlopen resolves exports and absent lookup fails; got {status}"
     );
+}
+
+/// Exercises the same bloom/bucket/chain/name comparisons as glibc's GNU-hash
+/// lookup on hosts that cannot dlopen an ELF image.
+fn assert_loader_lookup_contract(so: &Path) {
+    let gh = decode_gnu_hash(so).expect(".gnu.hash decodes");
+    for name in [
+        b"alpha".as_slice(),
+        b"beta",
+        b"gamma",
+        b"delta",
+        b"counter",
+        b"use_import",
+    ] {
+        assert!(
+            gnu_lookup(&gh, name).is_some(),
+            "loader lookup resolves {}",
+            String::from_utf8_lossy(name)
+        );
+    }
+    assert!(
+        gnu_lookup(&gh, b"__xold_missing_zzz").is_none(),
+        "an absent lookup reaches a chain terminator"
+    );
+    assert!(
+        gnu_lookup(&gh, b"extern_sym").is_none(),
+        "an undefined import is not in this object's defining hash tail"
+    );
+
+    let bytes = fs::read(so).expect("read shared object");
+    let obj = ObjectFile::parse(&bytes).expect("valid ELF");
+    let dynsym = obj.dynamic_symbols().expect("read dynsym").expect("dynsym");
+    let counter = dynsym
+        .syms
+        .iter()
+        .find(|sym| dynsym.name(sym) == b"counter")
+        .expect("counter export");
+    let addr = counter.st_value.get();
+    let value = obj.sections().iter().find_map(|sec| {
+        let base = sec.sh_addr.get();
+        if addr < base || addr.saturating_add(4) > base + sec.sh_size.get() {
+            return None;
+        }
+        let at = usize::try_from(addr - base).ok()?;
+        let data = obj.section_data(sec).ok()?;
+        data.get(at..at + 4)
+            .and_then(|cell| cell.try_into().ok())
+            .map(u32::from_le_bytes)
+    });
+    assert_eq!(value, Some(5), "the resolved counter export starts at five");
+}
+
+fn gnu_lookup(table: &GnuHash, name: &[u8]) -> Option<u32> {
+    let hash = gnu_hash(name);
+    let word = table.bloom
+        [((u64::from(hash) / 64) & u64::from(table.mask_words - 1)) as usize];
+    let first = u64::from(hash % 64);
+    let second = u64::from((hash >> table.bloom_shift) % 64);
+    if word & (1 << first) == 0 || word & (1 << second) == 0 {
+        return None;
+    }
+    let mut sym = *table.buckets.get((hash % table.nbuckets) as usize)?;
+    if sym < table.symoffset {
+        return None;
+    }
+    loop {
+        let at = usize::try_from(sym - table.symoffset).ok()?;
+        let chain = *table.chain.get(at)?;
+        if chain & !1 == hash & !1
+            && table
+                .hashed_names
+                .get(at)
+                .is_some_and(|found| found == name)
+        {
+            return Some(sym);
+        }
+        if chain & 1 != 0 {
+            return None;
+        }
+        sym = sym.checked_add(1)?;
+    }
 }
 
 /// The dynamic-executable path: a `-fPIE` main linked against a shared object

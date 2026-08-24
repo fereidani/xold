@@ -81,6 +81,13 @@ fn a_plain_reference_binds_a_version_suffixed_definition() {
     let prog = dir.join("sv_prog");
     link_to(&[def, start], &prog, b"_start", false, IcfMode::None, false)
         .expect("the plain reference must bind the foo@@VERS_1 definition");
+    if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        assert_plain_reference_contract(
+            &fs::read(&prog).expect("read linked image"),
+        );
+        let _ = fs::remove_dir_all(&dir);
+        return;
+    }
     let status = Command::new(&prog).status().expect("the program runs");
     assert_eq!(
         status.code(),
@@ -88,6 +95,59 @@ fn a_plain_reference_binds_a_version_suffixed_definition() {
         "the call must reach the versioned definition's code"
     );
     let _ = fs::remove_dir_all(&dir);
+}
+
+fn assert_plain_reference_contract(bytes: &[u8]) {
+    let obj = ObjectFile::parse(bytes).expect("valid ELF");
+    let symtab = obj.symbol_table().expect("read symtab").expect("symtab");
+    let value = |name: &[u8]| {
+        symtab
+            .syms
+            .iter()
+            .find(|sym| symtab.name(sym) == name)
+            .map(|sym| sym.st_value.get())
+            .unwrap_or_else(|| {
+                panic!("{} is defined", String::from_utf8_lossy(name))
+            })
+    };
+    let foo = value(b"foo");
+    assert_eq!(
+        foo,
+        value(b"foo_impl"),
+        "the versioned alias names its implementation"
+    );
+    assert_eq!(
+        image_at(&obj, foo, 6),
+        Some(b"\xb8\x2a\0\0\0\xc3".as_slice()),
+        "the definition returns 42"
+    );
+    let start = value(b"_start");
+    let body = image_at(&obj, start, 5).expect("_start call");
+    assert_eq!(body[0], 0xe8, "_start has a direct call");
+    let disp = i32::from_le_bytes(body[1..5].try_into().unwrap());
+    assert_eq!(
+        start
+            .wrapping_add(5)
+            .wrapping_add(i64::from(disp).cast_unsigned()),
+        foo,
+        "the plain call resolves to foo@@VERS_1"
+    );
+}
+
+fn image_at<'a>(
+    obj: &ObjectFile<'a>,
+    addr: u64,
+    len: usize,
+) -> Option<&'a [u8]> {
+    for sec in obj.sections() {
+        let base = sec.sh_addr.get();
+        if addr < base || addr >= base.saturating_add(sec.sh_size.get()) {
+            continue;
+        }
+        let at = usize::try_from(addr - base).ok()?;
+        return obj.section_data(sec).ok()?.get(at..at.checked_add(len)?);
+    }
+    None
 }
 
 /// A reference spelled `bar@VER_2` resolves against the dependency's

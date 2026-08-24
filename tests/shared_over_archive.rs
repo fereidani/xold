@@ -29,7 +29,7 @@ use std::{
     process::Command,
 };
 
-use common::which;
+use common::{archive_tool, which};
 use xold::{icf::IcfMode, linker::link_shared};
 
 mod common;
@@ -121,7 +121,7 @@ fn a_hidden_reference_still_extracts_the_archive_member() {
 /// Creates a fresh per-test working directory, or `None` (after printing a
 /// note) when the host cannot build the inputs.
 fn workdir(prefix: &str) -> Option<PathBuf> {
-    if which("clang").is_none() || which("ar").is_none() {
+    if which("clang").is_none() || archive_tool().is_none() {
         eprintln!("skipping shared-over-archive {prefix}: toolchain missing");
         return None;
     }
@@ -182,7 +182,7 @@ fn build_dependency(dir: &Path) -> Option<PathBuf> {
 
 /// Builds the static spelling: two members, one of them unreferenced.
 fn build_archive(dir: &Path) -> Option<PathBuf> {
-    let ar = which("ar")?;
+    let ar = archive_tool()?;
     let impl_o = dir.join("dsoarch_impl.o");
     let spare_o = dir.join("dsoarch_spare.o");
     compile(ARCHIVE_SRC, &impl_o)?;

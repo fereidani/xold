@@ -598,19 +598,36 @@ fn crt_objects() -> Option<Crt> {
 
 /// Builds `libdep.so` in `dir`, or `None` when the host toolchain cannot.
 fn shared_library(dir: &Path) -> Option<PathBuf> {
-    let clang = which("clang")?;
-    let src = dir.join("dep.c");
-    fs::write(&src, DEP_SRC).ok()?;
-    let out = dir.join("libdep.so");
-    let ok = Command::new(clang)
-        .args(["-fPIC", "-shared"])
-        .arg(&src)
-        .arg("-o")
-        .arg(&out)
-        .status()
-        .ok()?
-        .success();
-    ok.then_some(out)
+    #[cfg(target_os = "macos")]
+    {
+        let obj = compile(dir, "dep.c", DEP_SRC, &["-fPIC"])?;
+        let out = dir.join("libdep.so");
+        let (ok, _) = xold(&[
+            "-shared".into(),
+            "-soname".into(),
+            "libdep.so".into(),
+            "-o".into(),
+            path(&out),
+            path(&obj),
+        ]);
+        return ok.then_some(out);
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let clang = which("clang")?;
+        let src = dir.join("dep.c");
+        fs::write(&src, DEP_SRC).ok()?;
+        let out = dir.join("libdep.so");
+        let ok = Command::new(clang)
+            .args(["-fPIC", "-shared"])
+            .arg(&src)
+            .arg("-o")
+            .arg(&out)
+            .status()
+            .ok()?
+            .success();
+        ok.then_some(out)
+    }
 }
 
 /// Compiles one source file with the host `clang`.
@@ -625,7 +642,11 @@ fn compile(
     fs::write(&path, src).ok()?;
     let obj = dir.join(format!("{name}.o"));
     let ok = Command::new(clang)
-        .args(["-c", "-fno-asynchronous-unwind-tables"])
+        .args([
+            "--target=x86_64-linux-gnu",
+            "-c",
+            "-fno-asynchronous-unwind-tables",
+        ])
         .args(extra)
         .arg(&path)
         .arg("-o")

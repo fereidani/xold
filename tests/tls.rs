@@ -385,6 +385,13 @@ fn x86_64_tls_program_runs_and_reads_the_thread_local() {
     )
     .expect("xold TLS runtime link must succeed");
     let _ = fs::remove_file(&obj);
+    if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        assert_x86_tls_runtime_contract(
+            &fs::read(&out).expect("read linked image"),
+        );
+        let _ = fs::remove_file(&out);
+        return;
+    }
     let status = Command::new(&out)
         .status()
         .expect("linked TLS program must be runnable");
@@ -393,6 +400,35 @@ fn x86_64_tls_program_runs_and_reads_the_thread_local() {
         status.code(),
         Some(9),
         "the __thread variable must read back as 9"
+    );
+}
+
+/// Pins the three values the foreign runtime path depends on: the TLS template
+/// contains nine, the hand-built TCB seed stores nine at TP-4, and the linked
+/// local-exec access reads `%fs:-4` before exiting with that value.
+fn assert_x86_tls_runtime_contract(bytes: &[u8]) {
+    let tls = find_phdr(bytes, PT_TLS).expect("output has PT_TLS");
+    let template = usize::try_from(tls.p_offset).expect("TLS offset fits");
+    assert_eq!(read_u32(bytes, template), 9, "TLS template contains tvar=9");
+
+    let obj = ObjectFile::parse(bytes).expect("valid ELF");
+    let text = obj
+        .sections()
+        .iter()
+        .find(|sec| obj.section_name(sec) == b".text")
+        .and_then(|sec| obj.section_data(sec).ok())
+        .expect("text bytes");
+    assert!(
+        text.windows(6).any(|w| w == [0xc7, 0x00, 0x09, 0, 0, 0]),
+        "the setup seeds nine at TP-4"
+    );
+    assert!(
+        text.windows(9)
+            .any(|w| w == [0x64, 0x48, 0x8b, 0x04, 0x25, 0, 0, 0, 0])
+            && text
+                .windows(7)
+                .any(|w| w == [0x48, 0x8d, 0x80, 0xfc, 0xff, 0xff, 0xff]),
+        "the linked tvar access reads %fs:-4"
     );
 }
 

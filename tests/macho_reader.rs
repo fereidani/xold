@@ -12,7 +12,7 @@ use std::{
     process::{Command, Stdio},
 };
 
-use common::which;
+use common::{elf_fixture, which};
 use xold::{
     input::Format,
     macho::{
@@ -225,10 +225,7 @@ fn reject_reason(bytes: &[u8]) -> String {
 // --- helpers --------------------------------------------------------------
 
 fn fixture(name: &str) -> PathBuf {
-    let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    p.push("tests/fixtures");
-    p.push(name);
-    p
+    elf_fixture(name)
 }
 
 fn find_section<'d>(

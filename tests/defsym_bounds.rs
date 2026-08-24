@@ -104,7 +104,7 @@ fn compile(
     let obj = dir.join(format!("{name}.o"));
     fs::write(&file, src).ok()?;
     Command::new(clang)
-        .args(["-c", "-O1"])
+        .args(["--target=x86_64-linux-gnu", "-c", "-O1"])
         .args(extra)
         .arg("-o")
         .arg(&obj)

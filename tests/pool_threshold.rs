@@ -15,14 +15,14 @@
 
 use std::{fs, path::PathBuf};
 
+use common::elf_fixture;
 use rayon::ThreadPoolBuilder;
 use xold::{icf::IcfMode, linker::link_to, pool::fans_out};
 
+mod common;
+
 fn fixture(name: &str) -> PathBuf {
-    let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    p.push("tests/fixtures");
-    p.push(name);
-    p
+    elf_fixture(name)
 }
 
 fn temp(name: &str) -> PathBuf {

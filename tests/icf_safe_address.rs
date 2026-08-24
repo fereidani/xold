@@ -124,6 +124,11 @@ fn the_program_sees_two_distinct_function_pointers() {
     };
     let prog = dir.join("addr_run");
     link(&obj, &prog, IcfMode::Safe);
+    if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        assert_program_contract(&fs::read(&prog).expect("read linked image"));
+        let _ = fs::remove_dir_all(&dir);
+        return;
+    }
     let code = Command::new(&prog)
         .status()
         .expect("linked program must be runnable")
@@ -277,4 +282,65 @@ fn symbol_value(bytes: &[u8], name: &[u8]) -> Option<u64> {
         .iter()
         .find(|s| s.bind() == STB_GLOBAL && symtab.name(s) == name)
         .map(|s| s.st_value.get())
+}
+
+/// Structural equivalent of the exit-bit checks on a host that cannot run
+/// x86_64 ELF: the address-taken pair remains distinct, `pick`'s two LEAs
+/// resolve to exactly those addresses, and both arithmetic bodies retain the
+/// constants the runtime checks.
+fn assert_program_contract(bytes: &[u8]) {
+    let g1 = symbol_value(bytes, b"g1").expect("g1 present");
+    let g2 = symbol_value(bytes, b"g2").expect("g2 present");
+    assert_ne!(g1, g2, "pick returns two distinct function pointers");
+    let g1_body = image_bytes_at(bytes, g1, 15).expect("g1 body");
+    let g2_body = image_bytes_at(bytes, g2, 15).expect("g2 body");
+    assert_eq!(g1_body, g2_body, "both pointer targets compute alike");
+    assert!(
+        g1_body.windows(3).any(|w| w == [0x83, 0xc0, 0x03]),
+        "g1 and g2 retain x + 3"
+    );
+
+    let c1 = symbol_value(bytes, b"c1").expect("c1 present");
+    let c2 = symbol_value(bytes, b"c2").expect("c2 present");
+    assert_eq!(c1, c2, "the call-only pair folds to one implementation");
+    let call_body = image_bytes_at(bytes, c1, 13).expect("folded call body");
+    assert!(
+        call_body.windows(4).any(|w| w == [0x6b, 0x45, 0xfc, 0x05]),
+        "the folded implementation retains x * 5"
+    );
+
+    let pick = symbol_value(bytes, b"pick").expect("pick present");
+    let pick_body = image_bytes_at(bytes, pick, 33).expect("pick body");
+    let mut targets = Vec::new();
+    for at in 0..pick_body.len().saturating_sub(7) {
+        if pick_body[at..at + 3] == [0x48, 0x8d, 0x05]
+            || pick_body[at..at + 3] == [0x48, 0x8d, 0x0d]
+        {
+            let disp = i32::from_le_bytes(
+                pick_body[at + 3..at + 7]
+                    .try_into()
+                    .expect("LEA displacement"),
+            );
+            let next = pick + u64::try_from(at + 7).unwrap();
+            targets.push(next.wrapping_add(i64::from(disp).cast_unsigned()));
+        }
+    }
+    targets.sort_unstable();
+    let mut expected = vec![g1, g2];
+    expected.sort_unstable();
+    assert_eq!(targets, expected, "pick selects exactly g1 and g2");
+}
+
+fn image_bytes_at(bytes: &[u8], addr: u64, len: usize) -> Option<&[u8]> {
+    let obj = ObjectFile::parse(bytes).ok()?;
+    for sec in obj.sections() {
+        let base = sec.sh_addr.get();
+        if addr < base || addr >= base.saturating_add(sec.sh_size.get()) {
+            continue;
+        }
+        let at = usize::try_from(addr - base).ok()?;
+        let data = obj.section_data(sec).ok()?;
+        return data.get(at..at.checked_add(len)?);
+    }
+    None
 }

@@ -6,11 +6,9 @@
 //! world-readable, world-executable image -- on a build of something the user
 //! had asked the system to keep to themselves.
 //!
-//! The mode is `0o777` less the umask now. It is read from
-//! `/proc/self/status`, because there is no way to read it through libc
-//! without also setting it, and setting it -- even to put it straight back --
-//! would race every other thread in the process that creates a file, which a
-//! linker used as a library is not entitled to do.
+//! The mode is `0o777` less the umask now. Linux reports it through
+//! `/proc/self/status`; other hosts reveal it by creating and inspecting a
+//! private `0777` probe directory, which avoids changing the process umask.
 //!
 //! These tests drive the built binary in a shell with a chosen umask, since
 //! the umask is a property of the process doing the linking.

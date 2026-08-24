@@ -6,6 +6,7 @@
 
 use std::path::{Path, PathBuf};
 
+use common::elf_fixture;
 use xold::{
     archive::Archive,
     input::Input,
@@ -14,11 +15,10 @@ use xold::{
     symbol::SymbolKind,
 };
 
+mod common;
+
 fn fixture(name: &str) -> PathBuf {
-    let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    p.push("tests/fixtures");
-    p.push(name);
-    p
+    elf_fixture(name)
 }
 
 /// Finds a resolved symbol by exact name.

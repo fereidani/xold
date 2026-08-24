@@ -21,6 +21,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use common::elf_fixture;
 use rayon::ThreadPoolBuilder;
 use xold::{
     elf::ObjectFile,
@@ -29,11 +30,10 @@ use xold::{
     linker::{Link, link_image, link_shared},
 };
 
+mod common;
+
 fn fixture(name: &str) -> PathBuf {
-    let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    p.push("tests/fixtures");
-    p.push(name);
-    p
+    elf_fixture(name)
 }
 
 fn temp(name: &str) -> PathBuf {

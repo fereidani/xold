@@ -15,7 +15,8 @@
 //! same entries for a section that has them, nothing for one that does not,
 //! and the member still links.
 //!
-//! Gated on `clang` and `ar`; without them the tests print a note and return.
+//! Gated on `clang` and an ELF-capable `ar`; without them the tests print a
+//! note and return.
 
 use std::{
     fs,
@@ -23,7 +24,7 @@ use std::{
     process::Command,
 };
 
-use common::which;
+use common::{archive_tool, which};
 use xold::{icf::IcfMode, input::InputFile, linker::link_to};
 
 mod common;
@@ -142,7 +143,7 @@ fn member_bytes(dir: &Path) -> Option<Vec<u8>> {
 fn link_archive(dir: &Path) -> Option<Vec<u8>> {
     let member = compile(dir, MEMBER, "m")?;
     let main = compile(dir, MAIN, "main")?;
-    let ar = which("ar")?;
+    let ar = archive_tool()?;
     let lib = dir.join("lib.a");
     let made = Command::new(ar)
         .arg("rcs")

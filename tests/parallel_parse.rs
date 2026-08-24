@@ -13,9 +13,9 @@ use std::{
     process::Command,
 };
 
-use common::which;
+use common::{elf_fixture, which};
 use rayon::ThreadPoolBuilder;
-use xold::{icf::IcfMode, linker::link_to};
+use xold::{elf::ObjectFile, icf::IcfMode, linker::link_to};
 
 mod common;
 
@@ -94,10 +94,7 @@ fn build_chain(dir: &Path) -> Option<Vec<PathBuf>> {
 
 /// The freestanding `_start` fixture that calls `entry` and exits.
 fn start_fixture() -> PathBuf {
-    let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    p.push("tests/fixtures");
-    p.push("start.o");
-    p
+    elf_fixture("start.o")
 }
 
 /// Links `inputs` for `entry` on a fresh thread pool of `n` threads, returning
@@ -135,6 +132,12 @@ fn multi_file_chain_links_and_runs_correctly() {
     link_to(&inputs, &out, b"_start", false, IcfMode::None, false)
         .expect("link must succeed");
 
+    if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        assert_chain_contract(&fs::read(&out).expect("read linked image"));
+        let _ = fs::remove_file(&out);
+        return;
+    }
+
     let status = Command::new(&out)
         .status()
         .expect("linked program must be runnable");
@@ -169,4 +172,72 @@ fn multi_file_chain_is_byte_identical_across_thread_counts() {
 
     let _ = fs::remove_file(std::env::temp_dir().join("xold_pp_chain_1.out"));
     let _ = fs::remove_file(std::env::temp_dir().join("xold_pp_chain_8.out"));
+}
+
+/// Verifies every applied cross-file call in the linked chain. The final
+/// function returns 23; the generated source adds each preceding index, so a
+/// complete `entry -> step_0 -> ... -> step_23` path computes 276.
+fn assert_chain_contract(bytes: &[u8]) {
+    let obj = ObjectFile::parse(bytes).expect("valid ELF");
+    let symtab = obj.symbol_table().expect("read symtab").expect("symtab");
+    let symbol = |name: &[u8]| {
+        symtab
+            .syms
+            .iter()
+            .find(|sym| symtab.name(sym) == name)
+            .copied()
+            .unwrap_or_else(|| {
+                panic!("{} is defined", String::from_utf8_lossy(name))
+            })
+    };
+    let entry = symbol(b"entry");
+    let first = symbol(b"step_0");
+    assert_eq!(
+        call_target(&obj, entry.st_value.get(), entry.st_size.get()),
+        Some(first.st_value.get())
+    );
+    for i in 0..CHAIN_LEN - 1 {
+        let current = symbol(format!("step_{i}").as_bytes());
+        let next = symbol(format!("step_{}", i + 1).as_bytes());
+        assert_eq!(
+            call_target(&obj, current.st_value.get(), current.st_size.get()),
+            Some(next.st_value.get()),
+            "step_{i} calls step_{}",
+            i + 1
+        );
+    }
+    let last = symbol(b"step_23");
+    let body = image_at(&obj, last.st_value.get(), last.st_size.get())
+        .expect("last body");
+    assert!(
+        body.windows(5).any(|w| w == [0xb8, 23, 0, 0, 0]),
+        "step_23 returns 23"
+    );
+}
+
+fn call_target(obj: &ObjectFile<'_>, addr: u64, size: u64) -> Option<u64> {
+    let body = image_at(obj, addr, size)?;
+    let at = body.iter().position(|&byte| byte == 0xe8)?;
+    let disp = i32::from_le_bytes(body.get(at + 1..at + 5)?.try_into().ok()?);
+    Some(
+        addr.wrapping_add(u64::try_from(at + 5).ok()?)
+            .wrapping_add(i64::from(disp).cast_unsigned()),
+    )
+}
+
+fn image_at<'a>(
+    obj: &ObjectFile<'a>,
+    addr: u64,
+    size: u64,
+) -> Option<&'a [u8]> {
+    let len = usize::try_from(size).ok()?;
+    for sec in obj.sections() {
+        let base = sec.sh_addr.get();
+        if addr < base || addr >= base.saturating_add(sec.sh_size.get()) {
+            continue;
+        }
+        let at = usize::try_from(addr - base).ok()?;
+        return obj.section_data(sec).ok()?.get(at..at.checked_add(len)?);
+    }
+    None
 }

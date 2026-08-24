@@ -77,9 +77,10 @@ fn links_pe_dll_with_export_table() {
     // Build the loader EXE and run the LoadLibrary + GetProcAddress + call
     // round-trip under wine: add(40, 2) -> exit 42.
     assert!(build_exe(&exe), "loader link failed");
-    let (code, out) = run_wine(&exe, &dir);
-    let _ = out;
-    assert_eq!(code, 42, "wine exit code (expected add(40,2) == 42)");
+    if let Some((code, out)) = run_wine(&exe, &dir) {
+        let _ = out;
+        assert_eq!(code, 42, "wine exit code (expected add(40,2) == 42)");
+    }
 }
 
 /// Compiles the DLL source with clang `-msvc` and links it with `xold -shared`.
@@ -196,10 +197,10 @@ fn llvm_readobj_lists_export(dll: &Path, name: &str) -> bool {
 
 /// Runs `exe` under wine with its directory on the path so `LoadLibraryA` finds
 /// the sibling DLL. Returns `(exit_code, stdout)`.
-fn run_wine(exe: &Path, dir: &Path) -> (i32, String) {
+fn run_wine(exe: &Path, dir: &Path) -> Option<(i32, String)> {
     let Some(wine) = which("wine64").or_else(|| which("wine")) else {
         eprintln!("skipping wine run: wine not installed");
-        return (0, String::new());
+        return None;
     };
     // Wine's LoadLibraryA resolves a bare name against the loaded executable's
     // directory, so run from `dir` with the EXE addressed relatively.
@@ -213,7 +214,7 @@ fn run_wine(exe: &Path, dir: &Path) -> (i32, String) {
         .expect("run wine");
     let code = status.code().unwrap_or(-1);
     eprintln!("wine {} -> exit {code}", exe.display());
-    (code, String::new())
+    Some((code, String::new()))
 }
 
 // --- tooling helpers ------------------------------------------------------

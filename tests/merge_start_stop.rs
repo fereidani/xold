@@ -64,6 +64,11 @@ fn the_bounds_span_the_sections_own_content() {
     let Some(prog) = link(&dir) else {
         return;
     };
+    if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        assert_bound_run(&fs::read(&prog).expect("read linked image"));
+        let _ = fs::remove_dir_all(&dir);
+        return;
+    }
     let code = Command::new(&prog)
         .status()
         .expect("linked program must run")
@@ -169,4 +174,45 @@ fn section(bytes: &[u8], name: &[u8]) -> Option<Vec<u8>> {
 /// How many times `needle` appears in `hay`.
 fn occurrences(hay: &[u8], needle: &[u8]) -> usize {
     hay.windows(needle.len()).filter(|w| *w == needle).count()
+}
+
+/// Reads the two linker-defined bounds and the exact bytes between them, which
+/// is the same subtraction and content contract the foreign program checks.
+fn assert_bound_run(bytes: &[u8]) {
+    let obj = ObjectFile::parse(bytes).expect("valid ELF");
+    let symtab = obj.symbol_table().expect("read symtab").expect("symtab");
+    let value = |name: &[u8]| {
+        symtab
+            .syms
+            .iter()
+            .find(|sym| symtab.name(sym) == name)
+            .map(|sym| sym.st_value.get())
+            .unwrap_or_else(|| {
+                panic!("{} is defined", String::from_utf8_lossy(name))
+            })
+    };
+    let start = value(b"__start_regtab");
+    let stop = value(b"__stop_regtab");
+    assert_eq!(stop - start, 20, "the bounded run is exactly twenty bytes");
+    assert_eq!(
+        image_at(&obj, start, 20),
+        Some(b"entry-one\0entry-two\0".as_slice()),
+        "the run contains only its two registration entries"
+    );
+}
+
+fn image_at<'a>(
+    obj: &ObjectFile<'a>,
+    addr: u64,
+    len: usize,
+) -> Option<&'a [u8]> {
+    for sec in obj.sections() {
+        let base = sec.sh_addr.get();
+        if addr < base || addr >= base.saturating_add(sec.sh_size.get()) {
+            continue;
+        }
+        let at = usize::try_from(addr - base).ok()?;
+        return obj.section_data(sec).ok()?.get(at..at.checked_add(len)?);
+    }
+    None
 }

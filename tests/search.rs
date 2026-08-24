@@ -11,7 +11,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use xold::search::find_library;
+use xold::search::{find_library, find_macho_framework};
 
 /// A fresh per-test working directory under the system temp dir, following
 /// the convention of the neighbouring test files.
@@ -205,6 +205,21 @@ fn a_sysroot_redirects_the_default_directories() {
     let found = find_library("t", &[], Some(&work.join("sysroot")))
         .expect("resolves under the sysroot");
     assert_eq!(found, inside.join("libt.so.1"));
+}
+
+#[test]
+fn a_framework_resolves_inside_the_sdk() {
+    let work = workdir("search_framework");
+    let stub = work.join(
+        "System/Library/Frameworks/CoreFoundation.framework/\
+         CoreFoundation.tbd",
+    );
+    fs::create_dir_all(stub.parent().expect("framework parent")).unwrap();
+    fs::write(&stub, "--- !tapi-tbd\ninstall-name: fake\n").unwrap();
+    assert_eq!(
+        find_macho_framework("CoreFoundation", &[], Some(&work)),
+        Some(stub)
+    );
 }
 
 #[test]

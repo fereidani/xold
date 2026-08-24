@@ -11,7 +11,10 @@ use std::{
     path::PathBuf,
 };
 
-use inputs::{Inputs, has_syslibroot, parse_search_path, parse_sysroot};
+use inputs::{
+    Inputs, has_syslibroot, parse_framework_search_path, parse_search_path,
+    parse_sysroot,
+};
 use opts::{
     Attached, Parsed, attached, is_noop_flag, parse_build_id, parse_hash_style,
     parse_icf, parse_lib_marker, positional, raw_argument,
@@ -97,12 +100,18 @@ pub struct Options {
     pub no_fork: bool,
     /// `-dynamic`: produce a dyld-launched Mach-O executable.
     pub macho_dynamic: bool,
+    /// `-dylib`: produce an `MH_DYLIB` image rather than an executable.
+    pub macho_dylib: bool,
+    /// `-install_name`: identity recorded in `LC_ID_DYLIB`.
+    pub macho_install_name: Option<String>,
+    /// `-exported_symbols_list`: exact names published through dyld's export
+    /// trie. The file is read once the Mach-O path has been selected.
+    pub macho_exported_symbols: Option<PathBuf>,
     /// `-arch`: the Mach-O target named by the compiler driver.
     pub macho_arch: Option<MachoTarget>,
     /// `-platform_version`: deployment target and SDK metadata.
     pub macho_platform: Option<PlatformVersion>,
-    /// `-dead_strip`: requested Mach-O dead stripping. The current writer
-    /// records the request but has no atom-level liveness pass yet.
+    /// `-dead_strip`: enable the Mach-O section reachability pass.
     pub macho_dead_strip: bool,
 }
 /// What the command line asked for.
@@ -129,8 +138,10 @@ fn version_text() -> String {
 pub fn parse(args: &[OsString]) -> std::result::Result<Request, String> {
     let sysroot = parse_sysroot(args)?;
     let search = parse_search_path(args)?;
+    let framework_search = parse_framework_search_path(args)?;
     let mut inputs = Inputs {
         search,
+        framework_search,
         sysroot,
         macho_libraries: has_syslibroot(args),
         ..Default::default()
@@ -296,6 +307,17 @@ fn separated(
                 Some(opts::parse_platform_version(platform, min_os, sdk)?);
             return Ok(Some(at + 3));
         }
+        "-install_name" => {
+            p.macho_install_name =
+                Some(next(args, at, "-install_name")?.to_string());
+        }
+        "-exported_symbols_list" => {
+            p.macho_exported_symbols = Some(PathBuf::from(next_os(
+                args,
+                at,
+                "-exported_symbols_list",
+            )?));
+        }
         "--version-script" | "-version-script" => {
             p.version_script = Some(next(args, at, "--version-script")?.into());
         }
@@ -317,7 +339,8 @@ fn separated(
         }
         "-z" => p.zkeyword(next(args, at, "-z")?)?,
         "-l" => inputs.library(next(args, at, "-l")?)?,
-        "--sysroot" | "-syslibroot" | "-L" => {}
+        "-framework" => inputs.framework(next(args, at, "-framework")?)?,
+        "--sysroot" | "-syslibroot" | "-L" | "-F" => {}
         _ => return Ok(None),
     }
     Ok(Some(at + 1))
@@ -340,6 +363,10 @@ fn plain(
             inputs.kind = LibKind::ArchiveOnly;
         }
         "-dynamic" => p.macho_dynamic = true,
+        "-dylib" => {
+            p.macho_dynamic = true;
+            p.macho_dylib = true;
+        }
         "-dead_strip" => p.macho_dead_strip = true,
         "--no-threads" => p.threads = Some(1),
         s if s.starts_with("-z") && s.len() > 2 => p.zkeyword(&s[2..])?,
@@ -371,6 +398,7 @@ fn plain(
         // the input list.
         s if s.starts_with("--sysroot=") => {}
         s if s.starts_with("-L") && s.len() > 2 => {}
+        s if s.starts_with("-F") && s.len() > 2 => {}
         s if s.starts_with("-l") && s.len() > 2 => inputs.library(&s[2..])?,
         // An argument that looks like an option and reached this far is one
         // this linker does not implement. Falling through to the input list is

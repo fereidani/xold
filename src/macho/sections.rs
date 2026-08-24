@@ -22,7 +22,11 @@ use crate::{
             table_type,
         },
     },
-    reloc::Resolver,
+    reloc::{
+        Resolver,
+        macho_arm64::{ARM64_RELOC_SUBTRACTOR, ARM64_RELOC_UNSIGNED},
+        macho_x86_64::{X86_64_RELOC_SUBTRACTOR, X86_64_RELOC_UNSIGNED},
+    },
     symbol::SymbolId,
 };
 
@@ -163,6 +167,18 @@ fn apply_relocations<R: Resolver>(
     let mut i = 0;
     while i < relocs.len() {
         let reloc = &relocs[i];
+        if is_subtractor(ctx.target, reloc) {
+            let Some(next) = relocs.get(i.saturating_add(1)) else {
+                return Err(Error::Format(
+                    "Mach-O SUBTRACTOR has no paired UNSIGNED relocation",
+                ));
+            };
+            apply_subtractor_pair(
+                image, image_off, reloc, next, ctx, resolver,
+            )?;
+            i = i.saturating_add(2);
+            continue;
+        }
         // An arm64 ADDEND hint annotates the following entry; it has no fixup
         // of its own, so consume it and carry its addend forward.
         if ctx.target == MachoTarget::Arm64 && is_arm64_addend(reloc) {
@@ -183,6 +199,72 @@ fn apply_relocations<R: Resolver>(
         i = i.saturating_add(1);
     }
     Ok(())
+}
+
+/// Applies Mach-O's adjacent `SUBTRACTOR, UNSIGNED` pair as
+/// `minuend + embedded_addend - subtrahend`.
+///
+/// Darwin emits this pair throughout arm64 `__eh_frame`: the minuend is a
+/// function or LSDA and the subtrahend is the output `__eh_frame` base.  The
+/// generic relocation driver accepts one symbol at a time, so the section
+/// walker, which can see both records, reduces the pair before dispatch.
+fn apply_subtractor_pair<R: Resolver>(
+    image: &mut [u8],
+    image_off: usize,
+    subtractor: &MachReloc,
+    unsigned: &MachReloc,
+    ctx: &RelocCtx<'_>,
+    resolver: &R,
+) -> Result<()> {
+    if !is_unsigned(ctx.target, unsigned)
+        || subtractor.r_address != unsigned.r_address
+        || subtractor.r_length != unsigned.r_length
+        || !subtractor.r_extern
+        || !unsigned.r_extern
+    {
+        return Err(Error::Format(
+            "malformed Mach-O SUBTRACTOR/UNSIGNED relocation pair",
+        ));
+    }
+    let width = unsigned.width();
+    if width > 8 {
+        return Err(Error::OutOfRange("Mach-O SUBTRACTOR width"));
+    }
+    let slot_off = slot_offset(image_off, unsigned.r_address);
+    let end = slot_off
+        .checked_add(width)
+        .ok_or(Error::OutOfRange("Mach-O SUBTRACTOR slot"))?;
+    let slot = image
+        .get_mut(slot_off..end)
+        .ok_or(Error::OutOfRange("Mach-O SUBTRACTOR slot"))?;
+    let minuend = resolver.symbol_addr(SymbolId(
+        usize::try_from(unsigned.r_symbolnum).unwrap_or(0),
+    ));
+    let subtrahend = resolver.symbol_addr(SymbolId(
+        usize::try_from(subtractor.r_symbolnum).unwrap_or(0),
+    ));
+    let value = minuend
+        .wrapping_add_signed(raw_addend(unsigned, slot))
+        .wrapping_sub(subtrahend)
+        .to_le_bytes();
+    slot.copy_from_slice(&value[..width]);
+    Ok(())
+}
+
+fn is_subtractor(target: MachoTarget, reloc: &MachReloc) -> bool {
+    u32::from(reloc.r_type)
+        == match target {
+            MachoTarget::X86_64 => X86_64_RELOC_SUBTRACTOR,
+            MachoTarget::Arm64 => ARM64_RELOC_SUBTRACTOR,
+        }
+}
+
+fn is_unsigned(target: MachoTarget, reloc: &MachReloc) -> bool {
+    u32::from(reloc.r_type)
+        == match target {
+            MachoTarget::X86_64 => X86_64_RELOC_UNSIGNED,
+            MachoTarget::Arm64 => ARM64_RELOC_UNSIGNED,
+        }
 }
 
 /// File offset of a fixup site within a copied section.

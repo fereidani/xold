@@ -46,6 +46,8 @@ pub const FAT_CIGAM_64: u32 = 0xBFBA_FECA;
 pub const MH_OBJECT: u32 = 1;
 /// Demand-paged executable file (the linker's output for a program).
 pub const MH_EXECUTE: u32 = 2;
+/// Dynamically linked shared library.
+pub const MH_DYLIB: u32 = 6;
 
 // --- cpu types and subtypes ----------------------------------------------
 
@@ -79,6 +81,8 @@ pub const LC_DYSYMTAB: u32 = 0x0b;
 pub const LC_LOAD_DYLINKER: u32 = 0x0e;
 /// Load one dynamic library dependency.
 pub const LC_LOAD_DYLIB: u32 = 0x0c;
+/// Identity of a dynamic library, using the same payload as `LC_LOAD_DYLIB`.
+pub const LC_ID_DYLIB: u32 = 0x0d;
 /// A 16-byte unique image identifier.
 pub const LC_UUID: u32 = 0x1b;
 /// Main entry point (`entryoff` into `__TEXT`). Modern darwin executables use
@@ -141,6 +145,10 @@ pub const S_8BYTE_LITERALS: u32 = 0x4;
 pub const S_NON_LAZY_SYMBOL_POINTERS: u32 = 0x6;
 /// Fixed-size symbol stubs; `reserved2` is the size of one stub.
 pub const S_SYMBOL_STUBS: u32 = 0x8;
+/// Array of function pointers run when the image is loaded.
+pub const S_MOD_INIT_FUNC_POINTERS: u32 = 0x9;
+/// Array of function pointers run when the image is unloaded.
+pub const S_MOD_TERM_FUNC_POINTERS: u32 = 0x0a;
 /// Thread-local zero-fill data.
 pub const S_THREAD_LOCAL_ZEROFILL: u32 = 0x12;
 
@@ -150,6 +158,8 @@ pub const SECTION_ATTRIBUTES: u32 = 0xffff_ff00;
 pub const S_ATTR_SOME_INSTRUCTIONS: u32 = 0x0000_0400;
 /// Section is pure instructions (`S_ATTR_PURE_INSTRUCTIONS`).
 pub const S_ATTR_PURE_INSTRUCTIONS: u32 = 0x8000_0000;
+/// The section is a root for ld64 dead stripping.
+pub const S_ATTR_NO_DEAD_STRIP: u32 = 0x1000_0000;
 
 // --- symbol `n_type` masks and values ------------------------------------
 

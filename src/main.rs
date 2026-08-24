@@ -123,15 +123,45 @@ fn run(opts: &Options) -> Result<()> {
     let inputs = list.scan;
     check_command_line(opts, inputs)?;
     let files = list.views();
-    // Mach-O inputs (darwin objects) take a separate link path that produces a
-    // `MH_EXECUTE` image; the ELF linker cannot consume them. darwin programs
-    // conventionally enter at `_main`.
+    // Mach-O inputs take a separate link path; the ELF linker cannot consume
+    // them. Darwin executables conventionally enter at `_main`, while dylibs
+    // have no entry point.
     if inputs.macho {
         refuse_elf_only(opts, "Mach-O")?;
         if opts.shared {
             return Err(unsupported("-shared".into(), "Mach-O"));
         }
-        let entry = default_entry(opts, b"_main");
+        if opts.macho_install_name.is_some() && !opts.macho_dylib {
+            return Err(unsupported("-install_name".into(), "MH_EXECUTE"));
+        }
+        if opts.macho_exported_symbols.is_some() && !opts.macho_dynamic {
+            return Err(unsupported(
+                "-exported_symbols_list".into(),
+                "static Mach-O",
+            ));
+        }
+        let entry = if opts.macho_dylib {
+            b"".as_slice()
+        } else {
+            default_entry(opts, b"_main")
+        };
+        let install_name = if opts.macho_dylib {
+            Some(opts.macho_install_name.as_deref().map_or_else(
+                || {
+                    opts.output.to_str().ok_or_else(|| {
+                        Error::CommandLine(
+                            "Mach-O dylib output path is not valid UTF-8; \
+                                 use -install_name to give LC_ID_DYLIB a name"
+                                .into(),
+                        )
+                    })
+                },
+                Ok,
+            )?)
+        } else {
+            None
+        };
+        let exported_symbols = read_macho_exported_symbols(opts)?;
         let dylibs: Vec<Dylib<'_>> = list
             .dylibs
             .iter()
@@ -147,6 +177,9 @@ fn run(opts: &Options) -> Result<()> {
             &MachOLinkOptions {
                 arch: opts.macho_arch,
                 dynamic: opts.macho_dynamic,
+                dylib: opts.macho_dylib,
+                install_name,
+                exported_symbols: exported_symbols.as_deref(),
                 platform: opts.macho_platform,
                 dead_strip: opts.macho_dead_strip,
                 dylibs: &dylibs,
@@ -159,10 +192,12 @@ fn run(opts: &Options) -> Result<()> {
     // conventionally enter at `main` (no underscore on x86_64). With `-shared`
     // the image is a DLL carrying an export directory.
     if inputs.coff {
+        refuse_macho_output_options(opts, "COFF")?;
         refuse_elf_only(opts, "COFF")?;
         let entry = default_entry(opts, b"main");
         return link_coff(&files, &opts.output, entry, opts.shared);
     }
+    refuse_macho_output_options(opts, "ELF")?;
     let shared = inputs.shared;
     // The version script is read here rather than during parsing: a link that
     // never reaches the ELF path has no use for it, and a read that fails
@@ -202,6 +237,35 @@ fn run(opts: &Options) -> Result<()> {
         version_script: script.as_ref(),
         undefined_version: opts.undefined_version,
     })
+}
+
+/// Reads ld64's exact-symbol export allow-list.
+///
+/// The file format rustc writes is one symbol per line. ld64 also accepts
+/// wildcard patterns, but treating one as a literal would silently hide or
+/// publish the wrong API, so this implementation refuses that extension.
+fn read_macho_exported_symbols(opts: &Options) -> Result<Option<Vec<String>>> {
+    let Some(path) = opts.macho_exported_symbols.as_deref() else {
+        return Ok(None);
+    };
+    let text = std::fs::read_to_string(path)?;
+    let mut names = Vec::new();
+    for line in text.lines() {
+        let name = line.trim();
+        if name.is_empty() {
+            continue;
+        }
+        if name.bytes().any(|b| matches!(b, b'*' | b'?' | b'[')) {
+            return Err(Error::CommandLine(format!(
+                "wildcards in -exported_symbols_list are not implemented: \
+                 `{name}`"
+            )));
+        }
+        names.push(name.to_string());
+    }
+    names.sort_unstable();
+    names.dedup();
+    Ok(Some(names))
 }
 
 /// Reads and parses the `--version-script` file, when one was named.
@@ -281,6 +345,24 @@ fn refuse_elf_only(opts: &Options, format: &'static str) -> Result<()> {
         return Err(unsupported("-pie/-no-pie".into(), format));
     }
     Ok(())
+}
+
+/// Refuses Mach-O output controls when another format's inputs selected its
+/// writer. These options change the image and therefore cannot be ignored.
+fn refuse_macho_output_options(
+    opts: &Options,
+    format: &'static str,
+) -> Result<()> {
+    let option = if opts.macho_dylib {
+        Some("-dylib")
+    } else if opts.macho_install_name.is_some() {
+        Some("-install_name")
+    } else if opts.macho_exported_symbols.is_some() {
+        Some("-exported_symbols_list")
+    } else {
+        None
+    };
+    option.map_or(Ok(()), |name| Err(unsupported(name.into(), format)))
 }
 
 /// The error for an option this linker implements for ELF and not for

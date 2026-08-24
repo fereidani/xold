@@ -11,7 +11,7 @@
 //! own symbol resolution, layout and byte output, so the ELF writer and linker
 //! are untouched and stay byte-identical.
 
-use std::{hash::Hasher, path::Path};
+use std::{collections::BTreeMap, hash::Hasher, path::Path};
 
 use rustc_hash::{FxHashMap, FxHashSet, FxHasher};
 
@@ -26,13 +26,13 @@ use crate::{
             ARM_THREAD_STATE64, ARM_THREAD_STATE64_COUNT,
             ARM_THREAD_STATE64_PC, CPU_SUBTYPE_ARM64_ALL,
             CPU_SUBTYPE_X86_64_ALL, INDIRECT_SYMBOL_ABS, INDIRECT_SYMBOL_LOCAL,
-            LC_BUILD_VERSION, LC_DYLD_INFO_ONLY, LC_DYSYMTAB, LC_LOAD_DYLIB,
-            LC_LOAD_DYLINKER, LC_MAIN, LC_SEGMENT_64, LC_SYMTAB, LC_UNIXTHREAD,
-            LC_UUID, MH_DYLDLINK, MH_EXECUTE, MH_HAS_TLV_DESCRIPTORS,
-            MH_MAGIC_64, MH_NOUNDEFS, MH_PIE, MH_TWOLEVEL, N_ABS, N_EXT,
-            N_SECT, N_TYPE, N_UNDF, N_WEAK_REF, PAGEZERO_SIZE, VM_PROT_READ,
-            X86_THREAD_STATE64, X86_THREAD_STATE64_COUNT,
-            X86_THREAD_STATE64_RIP,
+            LC_BUILD_VERSION, LC_DYLD_INFO_ONLY, LC_DYSYMTAB, LC_ID_DYLIB,
+            LC_LOAD_DYLIB, LC_LOAD_DYLINKER, LC_MAIN, LC_SEGMENT_64, LC_SYMTAB,
+            LC_UNIXTHREAD, LC_UUID, MH_DYLDLINK, MH_DYLIB, MH_EXECUTE,
+            MH_HAS_TLV_DESCRIPTORS, MH_MAGIC_64, MH_NOUNDEFS, MH_PIE,
+            MH_TWOLEVEL, N_ABS, N_EXT, N_PEXT, N_SECT, N_TYPE, N_UNDF,
+            N_WEAK_REF, PAGEZERO_SIZE, VM_PROT_READ, X86_THREAD_STATE64,
+            X86_THREAD_STATE64_COUNT, X86_THREAD_STATE64_RIP,
         },
         got::GotKey,
         imports::ImportPlan,
@@ -45,12 +45,14 @@ use crate::{
             Nlist64, SectionHeader64, SegmentCommand64, SymtabCommand,
             ThreadCommand, UuidCommand,
         },
+        live::LiveSections,
         reloc::MachoTarget,
         sections,
         symtab::{self, Globals},
+        unwind,
     },
     pool,
-    util::{open_all, pad_name, trim_nul, write_output, write_pod},
+    util::{align_up, open_all, pad_name, trim_nul, write_output, write_pod},
 };
 
 /// On-disk size of one `nlist_64`.
@@ -139,6 +141,12 @@ fn write_executable(
     entry: &[u8],
     options: &LinkOptions<'_>,
 ) -> Result<Vec<u8>> {
+    if options.dylib && (!options.dynamic || options.install_name.is_none()) {
+        return Err(Error::CommandLine(
+            "a Mach-O dylib requires dynamic linking and an install name"
+                .into(),
+        ));
+    }
     let target = derive_target(inputs)?;
     if options.arch.is_some_and(|arch| arch != target) {
         return Err(Error::CommandLine(
@@ -146,12 +154,15 @@ fn write_executable(
         ));
     }
     let globals = Globals::build(inputs)?;
-    let imports = ImportPlan::build(inputs, &globals, target, options)?;
-    let mut got_plan = GotPlan::scan(inputs, target)?;
+    let live = LiveSections::build(inputs, &globals, entry, options);
+    let unwind_entries = unwind::entry_capacity(inputs, &live);
+    let imports = ImportPlan::build(inputs, &globals, target, options, &live)?;
+    let mut got_plan = GotPlan::scan(inputs, target, &live)?;
+    unwind::reserve_personality_got(inputs, &live, &mut got_plan);
     for import in imports.stubs() {
         got_plan.ensure_global(import.name);
     }
-    let plan = SymtabPlan::build(inputs)?;
+    let plan = SymtabPlan::build(inputs, &live)?;
     // The indirect symbol table follows the symbol/string table. Dynamic
     // opcode streams are planned from the resulting section addresses, then
     // a second layout stamps their final __LINKEDIT size; earlier segments do
@@ -169,6 +180,8 @@ fn write_executable(
         target,
         options,
         imports.stub_count(),
+        unwind_entries,
+        &live,
     )?;
     let dynamic = build_dynamic_info(
         inputs,
@@ -176,13 +189,43 @@ fn write_executable(
         &got_plan,
         &imports,
         &globals,
+        options,
     )?;
-    let rebase_relative = streams_relative;
-    let bind_relative = rebase_relative.saturating_add(
-        u64::try_from(dynamic.rebase.len()).unwrap_or(u64::MAX),
+    let provisional_common = common_addr_map(&globals, &provisional);
+    let provisional_sym_addr = resolve_all(
+        inputs,
+        &globals,
+        &provisional_common,
+        &provisional.sec_vaddr,
+        &imports,
+        provisional.stubs,
+        &live,
+    )?;
+    let exports = build_export_trie(
+        inputs,
+        &globals,
+        &plan,
+        &provisional_sym_addr,
+        options,
+    )?;
+    // LINKEDIT opcode payloads begin at pointer alignment. Apart from matching
+    // ld64, this keeps tools such as `dyld_info -fixups` from rejecting a bind
+    // stream whose preceding rebase stream has a non-aligned byte length.
+    let rebase_relative = align_up(streams_relative, 8);
+    let bind_relative = align_up(
+        rebase_relative.saturating_add(
+            u64::try_from(dynamic.rebase.len()).unwrap_or(u64::MAX),
+        ),
+        8,
     );
-    let linkedit_size = bind_relative
-        .saturating_add(u64::try_from(dynamic.bind.len()).unwrap_or(u64::MAX));
+    let export_relative = align_up(
+        bind_relative.saturating_add(
+            u64::try_from(dynamic.bind.len()).unwrap_or(u64::MAX),
+        ),
+        8,
+    );
+    let linkedit_size = export_relative
+        .saturating_add(u64::try_from(exports.len()).unwrap_or(u64::MAX));
     let layout = layout::build(
         inputs,
         linkedit_size,
@@ -192,6 +235,8 @@ fn write_executable(
         target,
         options,
         imports.stub_count(),
+        unwind_entries,
+        &live,
     )?;
     let common_addr = common_addr_map(&globals, &layout);
     let sym_addr = resolve_all(
@@ -201,6 +246,7 @@ fn write_executable(
         &layout.sec_vaddr,
         &imports,
         layout.stubs,
+        &live,
     )?;
     let got_addr = build_got_addr(inputs, &got_plan, layout.got);
     let sec_ordinal = section_ordinal_map(&layout)?;
@@ -220,9 +266,12 @@ fn write_executable(
         u32::try_from(dynamic.rebase.len()).unwrap_or(u32::MAX),
         bind_relative,
         u32::try_from(dynamic.bind.len()).unwrap_or(u32::MAX),
+        export_relative,
+        u32::try_from(exports.len()).unwrap_or(u32::MAX),
         imports.stub_count(),
     )?;
     write_sections(&mut image, inputs, target, &layout, &sym_addr, &got_addr)?;
+    unwind::write(&mut image, inputs, target, &layout, &sym_addr, &got_addr)?;
     write_tls_descriptors(&mut image, inputs, &layout, &sym_addr)?;
     write_stubs(&mut image, &layout, &imports, &got_plan)?;
     if let Some(got) = layout.got {
@@ -240,6 +289,8 @@ fn write_executable(
         &dynamic.rebase,
         bind_relative,
         &dynamic.bind,
+        export_relative,
+        &exports,
     );
     Ok(image)
 }
@@ -267,6 +318,7 @@ fn resolve_all(
     sec_vaddr: &[Vec<u64>],
     imports: &ImportPlan<'_>,
     stubs: Option<layout::StubLayout>,
+    live: &LiveSections,
 ) -> Result<Vec<Vec<u64>>> {
     let mut out = Vec::with_capacity(inputs.len());
     for (file, input) in inputs.iter().enumerate() {
@@ -276,7 +328,15 @@ fn resolve_all(
             let Some(sym) = input.symbols().nth(i) else {
                 continue;
             };
+            if sym.n_type & N_TYPE == N_SECT
+                && !live.section(file, u32::from(sym.n_sect))
+            {
+                continue;
+            }
             if sym.n_type & N_TYPE == N_UNDF && sym.n_value == 0 {
+                if !live.symbol(file, i) {
+                    continue;
+                }
                 if let Some(import) = imports.get(sym.name) {
                     *slot =
                         import.stub.zip(stubs).map_or(0, |(stub, layout)| {
@@ -323,38 +383,75 @@ fn build_dynamic_info(
     got: &GotPlan<'_>,
     imports: &ImportPlan<'_>,
     globals: &Globals<'_>,
+    options: &LinkOptions<'_>,
 ) -> Result<DynamicInfo> {
     let mut bind = Vec::new();
+    let mut rebases = Vec::new();
+    let mut seen_rebase = FxHashSet::default();
+    // Segment ordinals include __PAGEZERO in an executable. A dylib omits
+    // that segment, so __TEXT/__DATA shift down by one in every dyld opcode.
+    let text_segment = u8::from(!options.dylib);
+    let data_segment = text_segment + 1;
     if let Some(got_layout) = layout.got {
         let data = layout
             .data
             .as_ref()
             .ok_or(Error::Format("Mach-O GOT has no data segment"))?;
         for (slot, key) in got.iter() {
-            let GotKey::Global(name) = key else {
-                continue;
-            };
-            let Some(import) = imports.get(name) else {
-                continue;
-            };
             let offset = got_layout
                 .addr
                 .wrapping_sub(data.vmaddr)
                 .wrapping_add(u64::from(slot) * 8);
-            append_bind(&mut bind, import.dylib, name, 2, offset);
+            let needs_rebase = match key {
+                GotKey::Global(name) => {
+                    if let Some(import) = imports.get(name) {
+                        append_bind(
+                            &mut bind,
+                            import.dylib,
+                            name,
+                            data_segment,
+                            offset,
+                        );
+                        continue;
+                    }
+                    globals.get(name).is_some_and(|def| {
+                        def.common
+                            || inputs
+                                .get(def.file)
+                                .and_then(|input| {
+                                    input.symbols().nth(def.sym as usize)
+                                })
+                                .is_some_and(|sym| {
+                                    sym.n_type & N_TYPE == N_SECT
+                                })
+                    })
+                }
+                GotKey::Local { file, sym } => inputs
+                    .get(file)
+                    .and_then(|input| input.symbols().nth(sym as usize))
+                    .is_some_and(|sym| sym.n_type & N_TYPE == N_SECT),
+            };
+            if needs_rebase && seen_rebase.insert((data_segment, offset)) {
+                rebases.push((data_segment, offset));
+            }
         }
     }
 
-    let mut rebases = Vec::new();
-    let mut seen_rebase = FxHashSet::default();
     let mut seen_bind = FxHashSet::default();
-    for (segment_index, segment) in
-        [(1u8, Some(&layout.text)), (2u8, layout.data.as_ref())]
-    {
+    for (segment_index, segment) in [
+        (text_segment, Some(&layout.text)),
+        (data_segment, layout.data.as_ref()),
+    ] {
         let Some(segment) = segment else {
             continue;
         };
         for section in &segment.sections {
+            if matches!(
+                trim_nul(&section.sectname),
+                b"__eh_frame" | b"__unwind_info"
+            ) {
+                continue;
+            }
             for member in &section.members {
                 let input = inputs
                     .get(member.file)
@@ -482,6 +579,235 @@ fn write_uleb(out: &mut Vec<u8>, mut value: u64) {
             break;
         }
     }
+}
+
+// --- export trie ---------------------------------------------------------
+
+#[derive(Clone, Copy)]
+struct ExportTerminal {
+    flags: u64,
+    address: u64,
+}
+
+#[derive(Default)]
+struct RawExportNode {
+    terminal: Option<ExportTerminal>,
+    children: BTreeMap<u8, Self>,
+}
+
+struct ExportNode {
+    terminal: Option<ExportTerminal>,
+    children: Vec<(Vec<u8>, usize)>,
+}
+
+/// Builds dyld's compressed export trie. A dylib without an allow-list
+/// publishes every public external definition; an explicit list publishes
+/// exactly those names and diagnoses a name the link does not define.
+fn build_export_trie(
+    inputs: &[MachOFile<'_>],
+    globals: &Globals<'_>,
+    plan: &SymtabPlan<'_>,
+    sym_addr: &[Vec<u64>],
+    options: &LinkOptions<'_>,
+) -> Result<Vec<u8>> {
+    let requested = options.exported_symbols;
+    if !options.dylib && requested.is_none() {
+        return Ok(Vec::new());
+    }
+    let mut root = RawExportNode::default();
+    let mut emitted = FxHashSet::default();
+    for planned in &plan.extdef {
+        let name = plan_name(inputs, planned);
+        if !emitted.insert(name) {
+            continue;
+        }
+        if requested.is_some_and(|names| {
+            !names.iter().any(|want| want.as_bytes() == name)
+        }) {
+            continue;
+        }
+        let Some(def) = globals.get(name) else {
+            continue;
+        };
+        let Some(sym) = inputs
+            .get(def.file)
+            .and_then(|input| input.symbols().nth(def.sym as usize))
+        else {
+            continue;
+        };
+        if sym.n_type & N_PEXT != 0 {
+            continue;
+        }
+        let address = sym_addr
+            .get(def.file)
+            .and_then(|rows| rows.get(def.sym as usize))
+            .copied()
+            .ok_or(Error::OutOfRange("Mach-O export symbol address"))?;
+        let (flags, address) = if sym.n_type & N_TYPE == N_ABS {
+            (2, address) // EXPORT_SYMBOL_FLAGS_KIND_ABSOLUTE
+        } else {
+            (
+                0,
+                address.checked_sub(TEXT_BASE).ok_or(Error::OutOfRange(
+                    "Mach-O export address below image base",
+                ))?,
+            )
+        };
+        insert_export(&mut root, name, ExportTerminal { flags, address });
+    }
+    if let Some(names) = requested {
+        for name in names {
+            if !emitted.contains(name.as_bytes())
+                || find_export(&root, name.as_bytes()).is_none()
+            {
+                return Err(Error::CommandLine(format!(
+                    "-exported_symbols_list names `{name}`, but the link \
+                     does not define it as a public external symbol"
+                )));
+            }
+        }
+    }
+    if root.children.is_empty() && root.terminal.is_none() {
+        return Ok(Vec::new());
+    }
+    encode_export_trie(&root)
+}
+
+fn insert_export(
+    root: &mut RawExportNode,
+    name: &[u8],
+    terminal: ExportTerminal,
+) {
+    let mut node = root;
+    for &byte in name {
+        node = node.children.entry(byte).or_default();
+    }
+    node.terminal = Some(terminal);
+}
+
+fn find_export<'a>(
+    root: &'a RawExportNode,
+    name: &[u8],
+) -> Option<&'a ExportTerminal> {
+    let mut node = root;
+    for byte in name {
+        node = node.children.get(byte)?;
+    }
+    node.terminal.as_ref()
+}
+
+/// Flattens a byte trie into dyld's radix form, compressing every unary edge.
+fn flatten_export_trie(
+    raw: &RawExportNode,
+    out: &mut Vec<ExportNode>,
+) -> usize {
+    let index = out.len();
+    out.push(ExportNode {
+        terminal: raw.terminal,
+        children: Vec::new(),
+    });
+    let mut children = Vec::with_capacity(raw.children.len());
+    for (&first, child) in &raw.children {
+        let mut edge = vec![first];
+        let mut tail = child;
+        while tail.terminal.is_none() && tail.children.len() == 1 {
+            let Some((&byte, next)) = tail.children.iter().next() else {
+                break;
+            };
+            edge.push(byte);
+            tail = next;
+        }
+        let child_index = flatten_export_trie(tail, out);
+        children.push((edge, child_index));
+    }
+    out[index].children = children;
+    index
+}
+
+fn encode_export_trie(root: &RawExportNode) -> Result<Vec<u8>> {
+    let mut nodes = Vec::new();
+    flatten_export_trie(root, &mut nodes);
+    let mut offsets = vec![0usize; nodes.len()];
+    let mut sizes = vec![0usize; nodes.len()];
+    for _ in 0..32 {
+        for (slot, node) in sizes.iter_mut().zip(&nodes) {
+            *slot = export_node_size(node, &offsets)?;
+        }
+        let mut cursor = 0usize;
+        let mut next = Vec::with_capacity(nodes.len());
+        for size in &sizes {
+            next.push(cursor);
+            cursor = cursor.saturating_add(*size);
+        }
+        if next == offsets {
+            let mut out = Vec::with_capacity(cursor);
+            for node in &nodes {
+                write_export_node(&mut out, node, &offsets)?;
+            }
+            return Ok(out);
+        }
+        offsets = next;
+    }
+    Err(Error::Format("Mach-O export trie offsets did not converge"))
+}
+
+fn export_node_size(node: &ExportNode, offsets: &[usize]) -> Result<usize> {
+    let terminal = node.terminal.map_or(1, |term| {
+        let payload = uleb_size(term.flags) + uleb_size(term.address);
+        uleb_size(payload as u64) + payload
+    });
+    let mut size = terminal.saturating_add(1);
+    let _ = u8::try_from(node.children.len())
+        .map_err(|_| Error::OutOfRange("Mach-O export trie child count"))?;
+    for (edge, child) in &node.children {
+        let offset = offsets
+            .get(*child)
+            .copied()
+            .ok_or(Error::OutOfRange("Mach-O export trie child"))?;
+        size = size
+            .saturating_add(edge.len())
+            .saturating_add(1)
+            .saturating_add(uleb_size(offset as u64));
+    }
+    Ok(size)
+}
+
+fn write_export_node(
+    out: &mut Vec<u8>,
+    node: &ExportNode,
+    offsets: &[usize],
+) -> Result<()> {
+    if let Some(term) = node.terminal {
+        let payload = uleb_size(term.flags) + uleb_size(term.address);
+        write_uleb(out, payload as u64);
+        write_uleb(out, term.flags);
+        write_uleb(out, term.address);
+    } else {
+        out.push(0);
+    }
+    out.push(
+        u8::try_from(node.children.len())
+            .map_err(|_| Error::OutOfRange("Mach-O export trie child count"))?,
+    );
+    for (edge, child) in &node.children {
+        out.extend_from_slice(edge);
+        out.push(0);
+        let offset = offsets
+            .get(*child)
+            .copied()
+            .ok_or(Error::OutOfRange("Mach-O export trie child"))?;
+        write_uleb(out, offset as u64);
+    }
+    Ok(())
+}
+
+const fn uleb_size(mut value: u64) -> usize {
+    let mut size = 1;
+    while value >= 0x80 {
+        value >>= 7;
+        size += 1;
+    }
+    size
 }
 
 /// Writes arm64's three-instruction non-lazy symbol stubs:
@@ -626,12 +952,12 @@ struct SymtabPlan<'d> {
 }
 
 impl<'d> SymtabPlan<'d> {
-    fn build(inputs: &'d [MachOFile<'d>]) -> Result<Self> {
+    fn build(inputs: &'d [MachOFile<'d>], live: &LiveSections) -> Result<Self> {
         // Every name some input defines as a global. A reference to one of
         // these is satisfied inside the image, so emitting it as an undefined
         // row contradicts `MH_NOUNDEFS` -- `nm` showed `U _foo` in a static
         // image, and consumers that read the dysymtab ranges rejected it.
-        let defined = global_names(inputs);
+        let defined = global_names(inputs, live);
         let mut strtab = vec![0u8];
         let mut locals = Vec::new();
         let mut extdef = Vec::new();
@@ -660,7 +986,12 @@ impl<'d> SymtabPlan<'d> {
                 };
                 // Drop section-relative symbols whose section is not linked
                 // (e.g. a local label in a deferred unwind section).
-                if typ == N_SECT && !section_linked(&sections, input_n_sect) {
+                if typ == N_SECT
+                    && !section_linked(&sections, file, input_n_sect, live)
+                {
+                    continue;
+                }
+                if class == SymClass::Undef && !live.symbol(file, i) {
                     continue;
                 }
                 if class == SymClass::Undef && defined.contains(&sym.name) {
@@ -736,9 +1067,15 @@ impl<'d> SymtabPlan<'d> {
 }
 
 /// Whether the 1-based section ordinal `n_sect` of `sections` is linked.
-fn section_linked(sections: &[macho::MachSection<'_>], n_sect: u8) -> bool {
+fn section_linked(
+    sections: &[macho::MachSection<'_>],
+    file: usize,
+    n_sect: u8,
+    live: &LiveSections,
+) -> bool {
     let idx = usize::from(n_sect).saturating_sub(1);
     sections.get(idx).is_some_and(layout::is_linkable)
+        && live.section(file, u32::from(n_sect))
 }
 
 /// Rounds a byte offset up to the 4-byte alignment the indirect symbol
@@ -769,7 +1106,7 @@ fn write_header(
         magic: U32::new(MH_MAGIC_64),
         cputype: U32::new(cputype),
         cpusubtype: U32::new(cpusubtype),
-        filetype: U32::new(MH_EXECUTE),
+        filetype: U32::new(if options.dylib { MH_DYLIB } else { MH_EXECUTE }),
         ncmds: U32::new(command_count(layout, options)),
         sizeofcmds: U32::new(layout.sizeofcmds),
         flags: U32::new(if options.dynamic {
@@ -778,10 +1115,13 @@ fn write_header(
                     .iter()
                     .any(|s| trim_nul(&s.sectname) == b"__thread_vars")
             });
-            MH_NOUNDEFS
-                | MH_DYLDLINK
+            MH_DYLDLINK
                 | MH_TWOLEVEL
-                | MH_PIE
+                | if options.dylib {
+                    0
+                } else {
+                    MH_NOUNDEFS | MH_PIE
+                }
                 | if tlv { MH_HAS_TLV_DESCRIPTORS } else { 0 }
         } else {
             MH_NOUNDEFS
@@ -807,9 +1147,15 @@ fn cpu_fields(target: MachoTarget) -> (u32, u32) {
 
 /// The number of load commands the image emits.
 fn command_count(layout: &MachLayout, options: &LinkOptions<'_>) -> u32 {
-    // PAGEZERO, TEXT, LINKEDIT, maybe DATA.
-    let nseg = 3 + u32::from(layout.data.is_some());
-    let entry = if options.dynamic { 3 } else { 1 };
+    // TEXT, LINKEDIT, maybe DATA, and PAGEZERO for executables only.
+    let nseg = 2 + u32::from(layout.data.is_some()) + u32::from(!options.dylib);
+    let entry = if options.dylib {
+        2 // DYLD_INFO and ID_DYLIB.
+    } else if options.dynamic {
+        3 // DYLD_INFO, LOAD_DYLINKER and MAIN.
+    } else {
+        1 // UNIXTHREAD.
+    };
     nseg
         + 3 // SYMTAB, DYSYMTAB, UUID
         + entry
@@ -830,10 +1176,14 @@ fn write_commands(
     rebase_size: u32,
     bind_relative: u64,
     bind_size: u32,
+    export_relative: u64,
+    export_size: u32,
     stub_count: u32,
 ) -> Result<()> {
     let mut off = HEADER_SIZE;
-    off = write_pagezero(image, off);
+    if !options.dylib {
+        off = write_pagezero(image, off);
+    }
     off = write_segment(image, off, &layout.text)?;
     if let Some(data) = layout.data.as_ref() {
         off = write_segment(image, off, data)?;
@@ -857,6 +1207,8 @@ fn write_commands(
             rebase_size,
             bind_relative,
             bind_size,
+            export_relative,
+            export_size,
         );
     }
     if let Some(platform) = options.platform {
@@ -865,7 +1217,9 @@ fn write_commands(
     for dylib in options.dylibs {
         off = write_dylib(image, off, dylib.install_name)?;
     }
-    if options.dynamic {
+    if options.dylib {
+        off = write_id_dylib(image, off, options.install_name.unwrap_or(""))?;
+    } else if options.dynamic {
         off = write_dylinker(image, off)?;
         off = write_main(image, off, layout);
     } else {
@@ -905,9 +1259,12 @@ fn write_dyld_info(
     rebase_size: u32,
     bind_relative: u64,
     bind_size: u32,
+    export_relative: u64,
+    export_size: u32,
 ) -> u64 {
     let rebase_off = layout.linkedit_fileoff.saturating_add(rebase_relative);
     let bind_off = layout.linkedit_fileoff.saturating_add(bind_relative);
+    let export_off = layout.linkedit_fileoff.saturating_add(export_relative);
     write_pod(
         image,
         off,
@@ -926,8 +1283,12 @@ fn write_dyld_info(
             weak_bind_size: U32::new(0),
             lazy_bind_off: U32::new(0),
             lazy_bind_size: U32::new(0),
-            export_off: U32::new(0),
-            export_size: U32::new(0),
+            export_off: U32::new(if export_size == 0 {
+                0
+            } else {
+                u32::try_from(export_off).unwrap_or(0)
+            }),
+            export_size: U32::new(export_size),
         },
     )
 }
@@ -956,6 +1317,24 @@ fn write_dylib(image: &mut [u8], off: u64, name: &str) -> Result<u64> {
         off,
         &DylibCommand {
             cmd: U32::new(LC_LOAD_DYLIB),
+            cmdsize: U32::new(size),
+            name: U32::new(24),
+            timestamp: U32::new(0),
+            current_version: U32::new(0),
+            compatibility_version: U32::new(0),
+        },
+    );
+    write_command_string(image, off, 24, size, name)
+}
+
+/// Writes the identity of the output dynamic library.
+fn write_id_dylib(image: &mut [u8], off: u64, name: &str) -> Result<u64> {
+    let size = layout::dylib_command_size(name);
+    write_pod(
+        image,
+        off,
+        &DylibCommand {
+            cmd: U32::new(LC_ID_DYLIB),
             cmdsize: U32::new(size),
             name: U32::new(24),
             timestamp: U32::new(0),
@@ -1280,6 +1659,8 @@ fn write_linkedit(
     rebase: &[u8],
     bind_relative: u64,
     bind: &[u8],
+    export_relative: u64,
+    exports: &[u8],
 ) {
     let common_sect = common_section_ordinal(layout);
     let mut off = layout.linkedit_fileoff;
@@ -1330,6 +1711,12 @@ fn write_linkedit(
     let start = usize::try_from(bind_off).unwrap_or(usize::MAX);
     if let Some(dst) = image.get_mut(start..start.saturating_add(bind.len())) {
         dst.copy_from_slice(bind);
+    }
+    let export_off = layout.linkedit_fileoff.saturating_add(export_relative);
+    let start = usize::try_from(export_off).unwrap_or(usize::MAX);
+    if let Some(dst) = image.get_mut(start..start.saturating_add(exports.len()))
+    {
+        dst.copy_from_slice(exports);
     }
 }
 
@@ -1424,9 +1811,12 @@ fn plan_name<'d>(inputs: &'d [MachOFile<'d>], sym: &PlannedSym) -> &'d [u8] {
 
 /// Every name some input defines as a global, for dropping the undefined rows
 /// that the link itself satisfies.
-fn global_names<'d>(inputs: &'d [MachOFile<'d>]) -> FxHashSet<&'d [u8]> {
+fn global_names<'d>(
+    inputs: &'d [MachOFile<'d>],
+    live: &LiveSections,
+) -> FxHashSet<&'d [u8]> {
     let mut out = FxHashSet::default();
-    for input in inputs {
+    for (file, input) in inputs.iter().enumerate() {
         #[allow(clippy::explicit_iter_loop)]
         // `&syms` would borrow the temporary table rather than the mapped
         // bytes, and the names outlive it.
@@ -1437,7 +1827,7 @@ fn global_names<'d>(inputs: &'d [MachOFile<'d>]) -> FxHashSet<&'d [u8]> {
             let typ = sym.n_type & N_TYPE;
             // A tentative definition (`N_UNDF` with a size) defines the
             // name through the merged `__common` storage.
-            if typ == N_SECT
+            if (typ == N_SECT && live.section(file, u32::from(sym.n_sect)))
                 || typ == N_ABS
                 || (typ == N_UNDF && sym.n_value > 0)
             {

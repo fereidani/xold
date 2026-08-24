@@ -8,10 +8,10 @@
 //! segment boundary is page-aligned (`0x4000`), keeping `vmaddr % page` equal
 //! to `fileoff % page` so each segment is mmap-able.
 //!
-//! Only sections needed for a static executable are linked: code, read-only
-//! data and data/bss. Unwind (`__eh_frame`, `__compact_unwind`,
-//! `__unwind_info`), DWARF debug and dynamic-linker sections are deferred and
-//! dropped here.
+//! Code, read-only data, data/bss and exception payloads are linked.
+//! `__LD,__compact_unwind` is consumed to synthesize `__TEXT,__unwind_info`;
+//! `__eh_frame` and `__gcc_except_tab` remain in `__TEXT`. DWARF debug and
+//! input dynamic-linker sections are deferred and dropped here.
 
 use crate::{
     error::{Error, Result},
@@ -23,6 +23,7 @@ use crate::{
             S_SYMBOL_STUBS, S_THREAD_LOCAL_ZEROFILL, S_ZEROFILL, SECTION_TYPE,
             VM_PROT_EXECUTE, VM_PROT_READ, X86_THREAD_STATE64_COUNT,
         },
+        live::LiveSections,
         reloc::MachoTarget,
         symtab::CommonSym,
     },
@@ -144,10 +145,15 @@ pub fn build(
     target: MachoTarget,
     options: &LinkOptions<'_>,
     stub_count: u32,
+    unwind_entries: u32,
+    live: &LiveSections,
 ) -> Result<MachLayout> {
     let mut text_secs = Vec::new();
     let mut data_secs = Vec::new();
-    collect_sections(inputs, &mut text_secs, &mut data_secs);
+    collect_sections(inputs, live, &mut text_secs, &mut data_secs);
+    if unwind_entries > 0 {
+        inject_unwind_info(&mut text_secs, unwind_entries);
+    }
     if stub_count > 0 {
         inject_stubs(&mut text_secs, stub_count);
     }
@@ -175,7 +181,11 @@ pub fn build(
         stamp(d, &mut sec_vaddr);
     }
 
-    let entry_off = entry_offset(inputs, &sec_vaddr, entry)?;
+    let entry_off = if options.dylib {
+        0
+    } else {
+        entry_offset(inputs, &sec_vaddr, entry)?
+    };
     let got = find_got(data.as_ref());
     let stubs = find_stubs(&text);
     let common_addr = common_addresses(data.as_ref(), commons);
@@ -192,6 +202,31 @@ pub fn build(
         stubs,
         common_addr,
     })
+}
+
+/// Inserts a regular-page compact-unwind index immediately before
+/// `__eh_frame`. The writer fills it after section relocation, once final
+/// function and FDE offsets are known.
+fn inject_unwind_info(text_secs: &mut Vec<OutSection>, entries: u32) {
+    let size = crate::macho::unwind::section_size(entries);
+    let section = OutSection {
+        segname: pad_name(b"__TEXT"),
+        sectname: pad_name(b"__unwind_info"),
+        flags: 0,
+        align: 2,
+        members: Vec::new(),
+        addr: 0,
+        offset: 0,
+        size,
+        zerofill: false,
+        reserved1: 0,
+        reserved2: 0,
+    };
+    let at = text_secs
+        .iter()
+        .position(|candidate| trim_nul(&candidate.sectname) == b"__eh_frame")
+        .unwrap_or(text_secs.len());
+    text_secs.insert(at, section);
 }
 
 /// Prepends the synthetic `__got` section to `__DATA`. It is a non-lazy symbol
@@ -343,9 +378,13 @@ fn commands_size(
     } else {
         0
     };
-    // __PAGEZERO + __LINKEDIT segments, LC_SYMTAB, LC_DYSYMTAB, LC_UUID.
-    let base = 72 + 72 + 24 + 80 + 24;
-    let entry = if options.dynamic {
+    // __LINKEDIT, LC_SYMTAB, LC_DYSYMTAB and LC_UUID are common. Executables
+    // also carry __PAGEZERO; dylibs instead identify themselves.
+    let base = 72 + 24 + 80 + 24 + 72 * u32::from(!options.dylib);
+    let entry = if options.dylib {
+        // LC_DYLD_INFO_ONLY + LC_ID_DYLIB.
+        48 + dylib_command_size(options.install_name.unwrap_or(""))
+    } else if options.dynamic {
         // LC_DYLD_INFO_ONLY + LC_LOAD_DYLINKER + LC_MAIN.
         48 + dylinker_command_size() + 24
     } else {
@@ -561,12 +600,13 @@ fn entry_offset(
 /// `__DATA`-segment sections to `data_secs`.
 fn collect_sections(
     inputs: &[MachOFile<'_>],
+    live: &LiveSections,
     text_secs: &mut Vec<OutSection>,
     data_secs: &mut Vec<OutSection>,
 ) {
     for (file, input) in inputs.iter().enumerate() {
         for section in input.sections() {
-            if !is_linkable(&section) {
+            if !is_linkable(&section) || !live.section(file, section.index) {
                 continue;
             }
             if section.segname == b"__TEXT" {
@@ -656,8 +696,8 @@ impl OutSection {
 }
 
 /// Whether an input section is linked into the output. Code, read-only data
-/// and `__DATA` content are linked; unwind, DWARF debug, TLS and the
-/// dynamic-linker's symbol-pointer / stub sections are deferred.
+/// and `__DATA` content are linked, including final-image DWARF unwind data;
+/// debug and input dynamic-linker symbol-pointer / stub sections are deferred.
 pub fn is_linkable(section: &MachSection<'_>) -> bool {
     let seg = section.segname;
     if seg != b"__TEXT" && seg != b"__DATA" {
@@ -666,8 +706,8 @@ pub fn is_linkable(section: &MachSection<'_>) -> bool {
     !is_deferred(section.sectname)
 }
 
-/// Sections the minimal link defers: the unwind and debug tables, and the
-/// dynamic-linker metadata a static image has no use for.
+/// Sections consumed or synthesized elsewhere, debug tables, and input
+/// dynamic-linker metadata that must not be copied verbatim.
 ///
 /// Everything else in `__TEXT` and `__DATA` is linked. A whitelist of eleven
 /// names dropped anything a user named themselves --
@@ -680,10 +720,8 @@ fn is_deferred(name: &[u8]) -> bool {
     }
     matches!(
         name,
-        b"__eh_frame"
-            | b"__unwind_info"
+        b"__unwind_info"
             | b"__compact_unwind"
-            | b"__gcc_except_tab"
             | b"__llvm_addrsig"
             | b"__got"
             | b"__la_symbol_ptr"

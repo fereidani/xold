@@ -20,7 +20,7 @@
 
 use std::{fs, path::PathBuf, process::Command};
 
-use common::which;
+use common::{elf_fixture, which};
 use xold::{
     elf::{ObjectFile, Relocs},
     input::Input,
@@ -35,10 +35,7 @@ const SHT_REL: u32 = 9;
 const SHT_RELA: u32 = 4;
 
 fn fixture(name: &str) -> PathBuf {
-    let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    p.push("tests/fixtures");
-    p.push(name);
-    p
+    elf_fixture(name)
 }
 
 /// The byte offset of section header `index` within the file, read from the

@@ -28,7 +28,7 @@ use std::{
     process::Command,
 };
 
-use common::which;
+use common::{archive_tool, which};
 use xold::{icf::IcfMode, linker::link_to};
 
 mod common;
@@ -51,7 +51,7 @@ fn a_thin_archive_member_is_read_from_its_path() {
         return;
     };
     let lib = dir.join("libthin.a");
-    let archived = Command::new(which("ar").expect("checked in workdir"))
+    let archived = Command::new(archive_tool().expect("checked in workdir"))
         .args(["rcsT"])
         .arg(&lib)
         .arg(&member)
@@ -76,7 +76,7 @@ fn a_thin_archive_member_is_read_from_its_path() {
 /// Creates a fresh per-test working directory, or `None` (after printing a
 /// note) when the host cannot build the inputs.
 fn workdir() -> Option<PathBuf> {
-    if which("clang").is_none() || which("ar").is_none() {
+    if which("clang").is_none() || archive_tool().is_none() {
         eprintln!("skipping thin-archive: clang or ar unavailable");
         return None;
     }

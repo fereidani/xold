@@ -170,10 +170,20 @@ fn a_legacy_ctors_section_survives_gc() {
         "the collector must still drop what nothing reaches"
     );
 
-    let status = Command::new(&prog)
-        .status()
-        .expect("linked program must be runnable");
-    assert_eq!(status.code(), Some(0), "the gc-linked program must run");
+    if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        let status = Command::new(&prog)
+            .status()
+            .expect("linked program must be runnable");
+        assert_eq!(status.code(), Some(0), "the gc-linked program must run");
+    } else {
+        let image = ObjectFile::parse(&bytes).expect("valid ELF executable");
+        let start = symbol_addr(&bytes, b"_start").expect("_start is retained");
+        assert_eq!(
+            image.header().e_entry.get(),
+            start,
+            "the foreign executable's entry still points at _start"
+        );
+    }
     let _ = fs::remove_dir_all(&dir);
 }
 

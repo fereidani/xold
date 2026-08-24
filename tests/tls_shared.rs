@@ -20,6 +20,10 @@ use std::{
 
 use common::which;
 use xold::{
+    elf::{
+        ObjectFile,
+        constants::{SHT_REL, SHT_RELA},
+    },
     icf::IcfMode,
     linker::{link_shared, link_to},
 };
@@ -80,7 +84,7 @@ fn compile(
     let obj = dir.join(format!("{name}.o"));
     fs::write(&file, src).ok()?;
     Command::new(clang)
-        .args(["-c", "-O1", "-fPIC"])
+        .args(["--target=x86_64-linux-gnu", "-c", "-O1", "-fPIC"])
         .arg(format!("-ftls-model={model}"))
         .args(extra)
         .arg("-o")
@@ -102,12 +106,17 @@ fn libc_path() -> Option<PathBuf> {
 
 /// The dynamic relocations of `image`, as readelf prints them.
 fn relocs(image: &Path) -> String {
-    let Some(readelf) = which("readelf") else {
+    let out = if let Some(readelf) = which("readelf") {
+        Command::new(readelf).arg("-rW").arg(image).output()
+    } else if let Some(readobj) = which("llvm-readobj") {
+        Command::new(readobj)
+            .arg("--relocations")
+            .arg(image)
+            .output()
+    } else {
         return String::new();
     };
-    let Ok(out) = Command::new(readelf).arg("-rW").arg(image).output() else {
-        return String::new();
-    };
+    let Ok(out) = out else { return String::new() };
     String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
@@ -236,6 +245,10 @@ void _start(void) {
     let prog = dir.join("prog");
     link_to(&[obj], &prog, b"_start", false, IcfMode::None, false)
         .expect("an executable lowers the local-dynamic sequence");
+    assert_lowered_tls_image(&prog);
+    if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        return;
+    }
     let status = Command::new(&prog).status().expect("program runs");
     assert_eq!(status.code(), Some(0));
 
@@ -304,6 +317,10 @@ void _start(void) {
     let prog = dir.join("prog");
     link_to(&[obj], &prog, b"_start", false, IcfMode::None, false)
         .expect("the -fno-plt general-dynamic pair must lower");
+    assert_lowered_tls_image(&prog);
+    if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        return;
+    }
     let status = Command::new(&prog).status().expect("program runs");
     assert_eq!(status.code(), Some(0), "the lowered access must reach own");
 
@@ -372,4 +389,36 @@ int bump(void) { hidden += 1; return hidden; }
         text.contains("hidden") && text.contains("export"),
         "the diagnostic must name the symbol and the reason, got: {text}"
     );
+}
+
+/// The lowered executable has no dynamic TLS helper or unresolved fixups and
+/// retains a real TLS template. This is the loader-independent contract behind
+/// the runtime checks on a host that cannot execute x86_64 ELF.
+fn assert_lowered_tls_image(path: &Path) {
+    let bytes = fs::read(path).expect("read linked image");
+    let obj = ObjectFile::parse(&bytes).expect("valid ELF");
+    assert!(
+        obj.sections()
+            .iter()
+            .all(|sec| sec.sh_type.get() != SHT_RELA
+                && sec.sh_type.get() != SHT_REL),
+        "all TLS relocations are applied"
+    );
+    let tdata = obj
+        .sections()
+        .iter()
+        .find(|sec| obj.section_name(sec) == b".tdata")
+        .and_then(|sec| obj.section_data(sec).ok())
+        .expect("lowered image keeps its TLS template");
+    assert!(
+        tdata.iter().any(|&byte| byte != 0),
+        "TLS template is initialised"
+    );
+    let has_helper = obj.symbol_table().ok().flatten().is_some_and(|table| {
+        table
+            .syms
+            .iter()
+            .any(|sym| table.name(sym) == b"__tls_get_addr")
+    });
+    assert!(!has_helper, "the lowered image calls no TLS resolver");
 }

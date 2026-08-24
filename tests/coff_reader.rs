@@ -3,8 +3,8 @@
 //!
 //! Each test is gated on `clang --target=*-pc-windows-*` being available; if
 //! the cross target is absent the test prints a note and returns, so the build
-//! never fails over a missing toolchain. The committed ELF fixture backs the
-//! format-detection and reader-rejection checks that must always run.
+//! never fails over a missing toolchain. A minimal in-memory ELF header backs
+//! the format-detection and reader-rejection checks that must always run.
 
 use std::{
     fs,
@@ -38,6 +38,8 @@ const SRC: &[u8] = b"extern int ext_var;\n\
                     int global = 42;\n\
                     int *get_global(void) { return &global; }\n\
                     int call_ext(void) { return ext_func(ext_var); }\n";
+
+const ELF_HEADER: &[u8] = b"\x7fELF\x02\x01\x01\0";
 
 #[test]
 #[cfg_attr(miri, ignore = "needs the host toolchain, which Miri cannot spawn")]
@@ -155,9 +157,7 @@ fn parses_a_real_i386_msvc_object() {
 #[test]
 #[cfg_attr(miri, ignore = "needs the host toolchain, which Miri cannot spawn")]
 fn detects_coff_pe_elf_and_macho_format_by_magic() {
-    // A committed ELF fixture lets this check run without clang.
-    let elf = MappedFile::open(&fixture("min.o")).expect("open ELF fixture");
-    assert_eq!(Format::detect(elf.bytes()), Some(Format::Elf));
+    assert_eq!(Format::detect(ELF_HEADER), Some(Format::Elf));
 
     // A bare COFF x86_64 object: machine field 0x8664 little-endian.
     let coff = [0x64, 0x86, 0, 0, 0, 0, 0, 0];
@@ -178,8 +178,7 @@ fn detects_coff_pe_elf_and_macho_format_by_magic() {
 #[test]
 #[cfg_attr(miri, ignore = "needs the host toolchain, which Miri cannot spawn")]
 fn reader_rejects_non_coff_inputs() {
-    let elf = MappedFile::open(&fixture("min.o")).expect("open ELF fixture");
-    assert!(CoffFile::parse(elf.bytes()).is_err());
+    assert!(CoffFile::parse(ELF_HEADER).is_err());
     // A 64-bit Mach-O magic is rejected.
     let macho = [0xcf, 0xfa, 0xed, 0xfe, 0, 0, 0, 0];
     assert!(CoffFile::parse(&macho).is_err());
@@ -227,13 +226,6 @@ fn compile(clang: &Path, triple: &str, out: &Path) -> bool {
         .arg(out)
         .status()
         .is_ok_and(|s| s.success())
-}
-
-fn fixture(name: &str) -> PathBuf {
-    let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    p.push("tests/fixtures");
-    p.push(name);
-    p
 }
 
 fn find_section<'d>(

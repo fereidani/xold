@@ -368,13 +368,14 @@ fn a_caller_binds_to_a_shared_object_s_indirect_function() {
         eprintln!("skipping ifunc caller test: clang unavailable");
         return;
     };
+    let caller_src = "int doubler(int);\nint call_doubler(int);\n\
+         int main(void) { return doubler(16) + call_doubler(5); }\n";
+    if !cfg!(target_os = "linux") {
+        assert_foreign_caller_contract(&dir, &lib, caller_src);
+        return;
+    }
     let caller_c = dir.join("caller.c");
-    fs::write(
-        &caller_c,
-        "int doubler(int);\nint call_doubler(int);\n\
-         int main(void) { return doubler(16) + call_doubler(5); }\n",
-    )
-    .expect("write source");
+    fs::write(&caller_c, caller_src).expect("write source");
     let caller = dir.join("caller");
     let linked = Command::new(clang)
         .arg(&caller_c)
@@ -397,6 +398,65 @@ fn a_caller_binds_to_a_shared_object_s_indirect_function() {
         "doubler(16) + call_doubler(5) must be 42: the caller binds to the \
          implementation, not to the resolver"
     );
+}
+
+/// Builds the same ELF caller with xold when the host toolchain cannot link or
+/// execute ELF, then verifies both external calls bind through JUMP_SLOT rows
+/// to the shared object's plain-function exports. The library's own call keeps
+/// its IRELATIVE-backed stub.
+fn assert_foreign_caller_contract(dir: &Path, lib: &Path, caller_src: &str) {
+    let caller_o = dir.join("caller.o");
+    let start_o = dir.join("start.o");
+    compile(caller_src, &caller_o, false).expect("compile ELF caller");
+    assemble_start(&start_o).expect("assemble ELF entry");
+    let caller = dir.join("caller");
+    link_dyn_exec(
+        &[caller_o, start_o, lib.to_path_buf()],
+        &caller,
+        b"_start",
+        b"/lib64/ld-linux-x86-64.so.2",
+        false,
+        IcfMode::None,
+        false,
+    )
+    .expect("xold links the ELF caller against the xold library");
+
+    let caller_bytes = fs::read(&caller).expect("read caller");
+    let mut imports: Vec<Vec<u8>> = rela_rows(&caller_bytes, b".rela.plt")
+        .iter()
+        .filter(|row| row.2 == R_X86_64_JUMP_SLOT)
+        .filter_map(|row| dynamic_symbol_name(&caller_bytes, row.1))
+        .collect();
+    imports.sort_unstable();
+    assert_eq!(
+        imports,
+        vec![b"call_doubler".to_vec(), b"doubler".to_vec()],
+        "the caller binds both external calls through PLT slots"
+    );
+
+    let lib_bytes = fs::read(lib).expect("read ifunc library");
+    assert_one_irelative(&lib_bytes, &rela_rows(&lib_bytes, b".rela.plt"));
+    for name in [b"doubler".as_slice(), b"call_doubler"] {
+        let sym = dynamic_symbol(&lib_bytes, name).expect("library export");
+        assert_eq!(
+            sym.type_(),
+            STT_FUNC,
+            "{name:?} is a plain callable export"
+        );
+    }
+    let doubler = dynamic_symbol(&lib_bytes, b"doubler").unwrap();
+    let (plt, size) = section_span(&lib_bytes, b".plt").expect("library PLT");
+    assert!(
+        doubler.st_value.get() >= plt && doubler.st_value.get() < plt + size,
+        "the caller binds doubler to its IRELATIVE-backed stub"
+    );
+}
+
+fn dynamic_symbol_name(bytes: &[u8], index: u32) -> Option<Vec<u8>> {
+    let obj = ObjectFile::parse(bytes).ok()?;
+    let table = obj.dynamic_symbols().ok()??;
+    let sym = table.syms.get(usize::try_from(index).ok()?)?;
+    Some(table.name(sym).to_vec())
 }
 
 /// Builds the shared object under test with `xold -shared`, returning its

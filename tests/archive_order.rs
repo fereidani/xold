@@ -24,7 +24,7 @@ use std::{
     process::Command,
 };
 
-use common::which;
+use common::{archive_tool, which};
 use xold::{elf::ObjectFile, icf::IcfMode, linker::link_shared};
 
 mod common;
@@ -91,7 +91,7 @@ fn an_archive_named_before_the_shared_library_is_extracted() {
 // --- fixtures ---------------------------------------------------------------
 
 fn workdir() -> Option<PathBuf> {
-    if which("clang").is_none() || which("ar").is_none() {
+    if which("clang").is_none() || archive_tool().is_none() {
         eprintln!("skipping archive-order test: toolchain missing");
         return None;
     }
@@ -104,7 +104,7 @@ fn workdir() -> Option<PathBuf> {
 
 /// Builds the static spelling of the library.
 fn build_archive(dir: &Path) -> Option<PathBuf> {
-    let ar = which("ar")?;
+    let ar = archive_tool()?;
     let obj = dir.join("arord_arch.o");
     compile(ARCHIVE_SRC, &obj)?;
     let archive = dir.join("libd.a");

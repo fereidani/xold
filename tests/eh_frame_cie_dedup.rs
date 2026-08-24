@@ -38,39 +38,26 @@ mod common;
 /// own copy of the same personality-bearing CIE, which is what there is to
 /// share; the crt objects contribute a second, different shape, which there is
 /// not.
-const UNITS: [(&str, &str); 4] = [
-    (
-        "one",
-        "#include <stdexcept>\n\
-         int one(){ throw std::runtime_error(\"one\"); }\n",
-    ),
-    (
-        "two",
-        "#include <stdexcept>\n\
-         int two(){ throw std::runtime_error(\"two\"); }\n",
-    ),
-    (
-        "three",
-        "#include <stdexcept>\n\
-         int three(){ throw std::runtime_error(\"three\"); }\n",
-    ),
+const UNITS: [(&str, &str); 5] = [
+    ("one", "int one(){ throw \"one\"; }\n"),
+    ("two", "int two(){ throw \"two\"; }\n"),
+    ("three", "int three(){ throw \"three\"; }\n"),
     (
         "main",
-        "#include <cstdio>\n\
-         #include <stdexcept>\n\
+        "extern \"C\" int printf(const char *, ...);\n\
          int one(); int two(); int three();\n\
          int main(){\n\
              int n = 0;\n\
-             for (auto f : { one, two, three }) {\n\
-                 try { f(); }\n\
-                 catch (const std::exception& e) {\n\
-                     printf(\"caught: %s\\n\", e.what());\n\
-                     ++n;\n\
-                 }\n\
-             }\n\
+             try { one(); } catch (const char *e) { printf(\"caught: %s\\n\", e); ++n; }\n\
+             try { two(); } catch (const char *e) { printf(\"caught: %s\\n\", e); ++n; }\n\
+             try { three(); } catch (const char *e) { printf(\"caught: %s\\n\", e); ++n; }\n\
              return n == 3 ? 0 : 1;\n\
          }\n",
     ),
+    // A non-personality CIE is the distinct shape that the Linux crt objects
+    // otherwise contribute. Keeping it in the fixture makes the structural
+    // dedup check meaningful on hosts without a Linux crt/sysroot.
+    ("plain", "int plain(){ return 7; }\n"),
 ];
 
 /// One `.eh_frame` record: whether it is an FDE, its offset, and its bytes.
@@ -139,6 +126,10 @@ fn throws_across_units_still_unwind() {
     let Some(prog) = link_fixture("unwind") else {
         return;
     };
+    if !cfg!(target_os = "linux") {
+        assert_exception_metadata_survives(&prog);
+        return;
+    }
     let out = Command::new(&prog)
         .output()
         .expect("linked program must be runnable");
@@ -158,7 +149,7 @@ fn throws_across_units_still_unwind() {
 /// `None` when the host lacks the toolchain to build it.
 fn link_fixture(tag: &str) -> Option<PathBuf> {
     let clangxx = which("clang++")?;
-    if which("gcc").is_none() {
+    if cfg!(target_os = "linux") && which("gcc").is_none() {
         eprintln!("skipping CIE dedup tests: gcc unavailable (crt)");
         return None;
     }
@@ -180,26 +171,116 @@ fn link_fixture(tag: &str) -> Option<PathBuf> {
         assert!(ok, "host clang++ must compile {name}.cpp");
         inputs.push(obj);
     }
-    inputs.push(crt_file("crti.o")?);
-    inputs.push(crt_file("crt1.o")?);
-    inputs.push(crt_file("crtn.o")?);
-    inputs.push(libc_so()?);
-    inputs.push(libstdcxx_so()?);
-    // `_Unwind_Resume` lives in `libgcc_s`, which `libstdc++` names undefined.
-    inputs.push(libgcc_s_so()?);
-    let interp = interpreter()?;
     let prog = dir.join("prog");
-    xold::linker::link_dyn_exec(
-        &inputs,
-        &prog,
-        b"_start",
-        &interp,
-        false,
-        xold::icf::IcfMode::None,
-        false,
-    )
-    .expect("xold C++ link must succeed");
+    if cfg!(target_os = "linux") {
+        inputs.push(crt_file("crti.o")?);
+        inputs.push(crt_file("crt1.o")?);
+        inputs.push(crt_file("crtn.o")?);
+        inputs.push(libc_so()?);
+        inputs.push(libstdcxx_so()?);
+        // `_Unwind_Resume` lives in `libgcc_s`, which `libstdc++` names
+        // undefined.
+        inputs.push(libgcc_s_so()?);
+        let interp = interpreter()?;
+        xold::linker::link_dyn_exec(
+            &inputs,
+            &prog,
+            b"_start",
+            &interp,
+            false,
+            xold::icf::IcfMode::None,
+            false,
+        )
+        .expect("xold C++ link must succeed");
+    } else {
+        xold::linker::link_shared(
+            &inputs,
+            &prog,
+            None,
+            false,
+            xold::icf::IcfMode::None,
+            false,
+        )
+        .expect("xold C++ shared link must succeed");
+    }
     Some(prog)
+}
+
+/// Non-ELF hosts cannot execute the x86_64 image, so verify the exact unwind
+/// contract the runtime consumes: every FDE reaches a retained CIE and the
+/// language-specific handler table survived the link.
+fn assert_exception_metadata_survives(prog: &Path) {
+    let records = eh_frame_records(prog);
+    let cies: HashSet<usize> =
+        records.iter().filter(|r| !r.fde).map(|r| r.at).collect();
+    let mut fdes = 0usize;
+    for record in records.iter().filter(|r| r.fde) {
+        let back = u32::from_le_bytes(
+            record.bytes[4..8].try_into().expect("CIE pointer"),
+        ) as usize;
+        let target = record
+            .at
+            .checked_add(4)
+            .and_then(|field| field.checked_sub(back))
+            .expect("FDE points backward to its CIE");
+        assert!(cies.contains(&target), "every FDE reaches a retained CIE");
+        fdes += 1;
+    }
+    assert!(fdes >= 4, "throwers and catcher retain their FDEs");
+
+    let lsda_cies: HashSet<usize> = records
+        .iter()
+        .filter(|r| !r.fde && cie_has_lsda(&r.bytes))
+        .map(|r| r.at)
+        .collect();
+    assert!(!lsda_cies.is_empty(), "a catcher CIE advertises an LSDA");
+
+    let bytes = fs::read(prog).expect("read output");
+    let obj = ObjectFile::parse(&bytes).expect("valid ELF");
+    let eh = obj
+        .sections()
+        .iter()
+        .find(|s| obj.section_name(s) == b".eh_frame")
+        .expect("output carries .eh_frame");
+    let rodata = obj
+        .sections()
+        .iter()
+        .find(|s| obj.section_name(s) == b".rodata")
+        .expect("the merged handler table is in .rodata");
+    let ro_start = rodata.sh_addr.get();
+    let ro_end = ro_start.saturating_add(rodata.sh_size.get());
+    let mut lsda_fdes = 0usize;
+    for record in records.iter().filter(|r| r.fde) {
+        let back = u32::from_le_bytes(
+            record.bytes[4..8].try_into().expect("CIE pointer"),
+        ) as usize;
+        let cie = record.at + 4 - back;
+        if !lsda_cies.contains(&cie) {
+            continue;
+        }
+        // This fixture's CIE advertises pcrel+sdata4 for the LSDA. After the
+        // two four-byte PC fields, the FDE carries a one-byte augmentation
+        // length followed by that signed displacement.
+        assert_eq!(record.bytes.get(16), Some(&4), "one sdata4 LSDA field");
+        let disp = i32::from_le_bytes(
+            record.bytes[17..21].try_into().expect("LSDA displacement"),
+        );
+        let field = eh.sh_addr.get() + u64::try_from(record.at + 17).unwrap();
+        let lsda = field.wrapping_add(i64::from(disp).cast_unsigned());
+        assert!(
+            lsda >= ro_start && lsda < ro_end,
+            "the FDE's LSDA lands in the retained handler table"
+        );
+        lsda_fdes += 1;
+    }
+    assert!(lsda_fdes > 0, "a catcher FDE retains its LSDA pointer");
+}
+
+fn cie_has_lsda(bytes: &[u8]) -> bool {
+    bytes
+        .get(9..)
+        .and_then(|tail| tail.split(|&byte| byte == 0).next())
+        .is_some_and(|augmentation| augmentation.contains(&b'L'))
 }
 
 /// Walks the output `.eh_frame` into its records.

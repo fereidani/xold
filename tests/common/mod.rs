@@ -14,7 +14,12 @@
 
 #![allow(dead_code)]
 
-use std::{path::PathBuf, process::Command};
+use std::{
+    collections::HashMap,
+    path::PathBuf,
+    process::Command,
+    sync::{Mutex, OnceLock},
+};
 
 /// Resolves `cmd` on `PATH`, or `None` when it is not there.
 pub fn which(cmd: &str) -> Option<PathBuf> {
@@ -26,6 +31,92 @@ pub fn which(cmd: &str) -> Option<PathBuf> {
         }
     }
     None
+}
+
+/// Resolves an archive tool that can index the x86_64 ELF fixtures.
+///
+/// Apple's `/usr/bin/ar` accepts an ELF member but leaves it without a symbol
+/// index, so lazy archive extraction cannot exercise the behavior under test.
+/// LLVM's implementation is cross-format and ships with the clang toolchain.
+pub fn archive_tool() -> Option<PathBuf> {
+    #[cfg(target_os = "macos")]
+    {
+        which("llvm-ar")
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        which("ar")
+    }
+}
+
+/// Returns a compiled x86_64 ELF object for a tracked source fixture.
+///
+/// Object files are intentionally not tracked. Build each one once per test
+/// process in a private temp directory so parallel integration tests neither
+/// depend on repository-generated artifacts nor race one another.
+pub fn elf_fixture(name: &str) -> PathBuf {
+    let mut tracked = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    tracked.push("tests/fixtures");
+    tracked.push(name);
+    if tracked.is_file() {
+        return tracked;
+    }
+    assert_eq!(
+        tracked.extension().and_then(|ext| ext.to_str()),
+        Some("o"),
+        "missing non-object fixture {}",
+        tracked.display()
+    );
+
+    static BUILT: OnceLock<Mutex<HashMap<String, PathBuf>>> = OnceLock::new();
+    let mut built = BUILT
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .expect("fixture cache lock");
+    if let Some(path) = built.get(name) {
+        return path.clone();
+    }
+
+    let stem = name.strip_suffix(".o").expect("checked object suffix");
+    let source_ext = if stem == "start" { "S" } else { "c" };
+    let source = tracked.with_file_name(format!("{stem}.{source_ext}"));
+    assert!(
+        source.is_file(),
+        "fixture source {} exists",
+        source.display()
+    );
+    let dir = std::env::temp_dir()
+        .join(format!("xold-fixtures-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("create fixture directory");
+    let output = dir.join(name);
+    let clang = which("clang").expect("clang builds ELF fixtures");
+    let mut command = Command::new(clang);
+    command.arg("--target=x86_64-linux-gnu");
+    match stem {
+        "min" => {
+            command.arg("-fPIC");
+        }
+        "prog" => {
+            command.args(["-ffreestanding", "-fno-pie", "-fno-pic"]);
+        }
+        "start" => {}
+        "common_obj" => {
+            command.args(["-fPIC", "-fcommon"]);
+        }
+        _ => {
+            command.arg("-fPIC");
+        }
+    }
+    let ok = command
+        .arg("-c")
+        .arg(&source)
+        .arg("-o")
+        .arg(&output)
+        .status()
+        .is_ok_and(|status| status.success());
+    assert!(ok, "clang builds {}", source.display());
+    built.insert(name.to_owned(), output.clone());
+    output
 }
 
 /// The host path of `name` (`crt1.o`, `libc.so.6`, ...) as gcc resolves it,

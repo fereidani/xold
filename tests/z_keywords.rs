@@ -190,7 +190,7 @@ fn compile(
     fs::write(&file, src).ok()?;
     let obj = dir.join(format!("{name}.o"));
     let ok = Command::new(clang)
-        .arg("-c")
+        .args(["--target=x86_64-linux-gnu", "-c"])
         .args(extra)
         .arg(&file)
         .arg("-o")

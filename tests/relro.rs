@@ -370,8 +370,13 @@ fn a_static_link_emits_the_program_header_table_it_declares() {
     // to protect.
     check_relro(&bytes);
 
-    let status = Command::new(&prog).status().expect("static prog runnable");
-    assert!(status.success(), "static image must run, got {status}");
+    if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        let status =
+            Command::new(&prog).status().expect("static prog runnable");
+        assert!(status.success(), "static image must run, got {status}");
+    } else {
+        assert_static_entry(&bytes);
+    }
 }
 
 /// A writable segment whose only content is `SHT_NOBITS` reports an empty file
@@ -415,10 +420,41 @@ fn a_bss_only_writable_segment_reports_no_file_bytes() {
         rw.memsz
     );
 
-    let status = Command::new(&prog)
-        .status()
-        .expect("bss-only prog runnable");
-    assert!(status.success(), "bss-only image must run, got {status}");
+    if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        let status = Command::new(&prog)
+            .status()
+            .expect("bss-only prog runnable");
+        assert!(status.success(), "bss-only image must run, got {status}");
+    } else {
+        assert_static_entry(&bytes);
+    }
+}
+
+/// Pins the launch contract of a foreign static ELF image after its segment
+/// layout has been checked: the entry is `_start`, which performs
+/// `exit_group(0)`.
+fn assert_static_entry(bytes: &[u8]) {
+    let obj = ObjectFile::parse(bytes).expect("valid ELF");
+    let symtab = obj.symbol_table().expect("read symtab").expect("symtab");
+    let start = symtab
+        .syms
+        .iter()
+        .find(|sym| symtab.name(sym) == b"_start")
+        .expect("_start defined")
+        .st_value
+        .get();
+    assert_eq!(obj.header().e_entry.get(), start, "ELF enters at _start");
+    let text = obj
+        .sections()
+        .iter()
+        .find(|sec| obj.section_name(sec) == b".text")
+        .and_then(|sec| obj.section_data(sec).ok())
+        .expect("text bytes");
+    assert!(
+        text.windows(9)
+            .any(|w| w == [0x31, 0xff, 0xb8, 0xe7, 0, 0, 0, 0x0f, 0x05]),
+        "_start performs exit_group(0)"
+    );
 }
 
 // --- shared assertions -----------------------------------------------------

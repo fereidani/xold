@@ -247,6 +247,13 @@ fn dlopen_resolves_and_calls_the_exported_symbol() {
     compile_pic(SHARED_SRC, &obj).expect("host clang compiles -fPIC");
     link_shared_with_xold(&obj, &so);
 
+    if !cfg!(target_os = "linux") {
+        assert_export_loader_contract(&so);
+        let _ = fs::remove_file(&obj);
+        let _ = fs::remove_file(&so);
+        return;
+    }
+
     let harness_src = b"#include <dlfcn.h>\n\
         #include <stdio.h>\n\
         #include <stdlib.h>\n\
@@ -325,6 +332,13 @@ fn dlopen_resolves_absolute_data_pointers() {
         has_abs,
         ".rela.dyn must carry an R_X86_64_64 for the global pointer"
     );
+
+    if !cfg!(target_os = "linux") {
+        assert_data_pointer_loader_contract(&so, &bytes, &rela_bytes);
+        let _ = fs::remove_file(&obj);
+        let _ = fs::remove_file(&so);
+        return;
+    }
 
     let harness_src = b"#include <dlfcn.h>\n\
         #include <stdio.h>\n\
@@ -493,6 +507,121 @@ fn rela_dyn_bytes(bytes: &[u8]) -> Vec<(u64, u32, u32, i64)> {
         out.push((off, sym, ty, add));
     }
     out
+}
+
+/// Structural equivalent of the ELF-loader round trip on non-ELF hosts: the
+/// exported function and datum are discoverable through the hash-backed
+/// dynamic symbol table, and the datum's loader fixup names it and lands in
+/// the GOT that `bump` reads.
+fn assert_export_loader_contract(so: &Path) {
+    let bytes = fs::read(so).expect("output readable");
+    let names = dynsym_names(so);
+    assert!(names.iter().any(|n| n == b"bump"), "bump is exported");
+    assert!(names.iter().any(|n| n == b"counter"), "counter is exported");
+    assert!(has_hash(&dt_tags(so)), "the loader can hash dynamic names");
+    let reloc = rela_dyn_bytes(&bytes)
+        .into_iter()
+        .find(|(_, sym, ty, _)| {
+            *ty == xold::reloc::x86_64::R_X86_64_GLOB_DAT
+                && dynsym_name(&bytes, *sym).as_deref() == Some(b"counter")
+        })
+        .expect("counter has a GLOB_DAT loader relocation");
+    assert!(
+        section_contains(&bytes, b".got", reloc.0),
+        "counter's loader relocation fills its GOT slot"
+    );
+}
+
+/// Pins the exact pointer values the ELF loader would materialise: `gp` is
+/// the R_X86_64_64 site naming `counter`, whose initial value is five, and
+/// the relative relocation's addend names the private integer initialised to
+/// seven.
+fn assert_data_pointer_loader_contract(
+    so: &Path,
+    bytes: &[u8],
+    relas: &[(u64, u32, u32, i64)],
+) {
+    let names = dynsym_names(so);
+    for name in [b"bump".as_slice(), b"readlp", b"gp", b"counter"] {
+        assert!(names.iter().any(|n| n == name), "{name:?} is exported");
+    }
+    let absolute = relas
+        .iter()
+        .find(|(_, _, ty, _)| *ty == xold::reloc::x86_64::R_X86_64_64)
+        .expect("global pointer has an absolute loader relocation");
+    assert_eq!(
+        dynsym_name(bytes, absolute.1).as_deref(),
+        Some(b"counter".as_slice()),
+        "gp binds to counter"
+    );
+    assert_eq!(
+        dynsym_value(bytes, b"gp"),
+        Some(absolute.0),
+        "the absolute relocation writes gp"
+    );
+    let counter = dynsym_value(bytes, b"counter").expect("counter value");
+    assert_eq!(image_u32(bytes, counter), Some(5), "counter starts at five");
+
+    let relative = relas
+        .iter()
+        .find(|(_, sym, ty, _)| {
+            *sym == 0 && *ty == xold::reloc::x86_64::R_X86_64_RELATIVE
+        })
+        .expect("private pointer has a relative loader relocation");
+    let local =
+        u64::try_from(relative.3).expect("relative addend is an address");
+    assert_eq!(
+        image_u32(bytes, local),
+        Some(7),
+        "the relative relocation names the private integer initialised to seven"
+    );
+}
+
+fn dynsym_name(bytes: &[u8], index: u32) -> Option<Vec<u8>> {
+    let obj = ObjectFile::parse(bytes).ok()?;
+    let table = obj.dynamic_symbols().ok()??;
+    let sym = table.syms.get(usize::try_from(index).ok()?)?;
+    Some(table.name(sym).to_vec())
+}
+
+fn dynsym_value(bytes: &[u8], name: &[u8]) -> Option<u64> {
+    let obj = ObjectFile::parse(bytes).ok()?;
+    let table = obj.dynamic_symbols().ok()??;
+    table
+        .syms
+        .iter()
+        .find(|sym| table.name(sym) == name)
+        .map(|sym| sym.st_value.get())
+}
+
+fn section_contains(bytes: &[u8], name: &[u8], addr: u64) -> bool {
+    let Ok(obj) = ObjectFile::parse(bytes) else {
+        return false;
+    };
+    obj.sections().iter().any(|sec| {
+        obj.section_name(sec) == name
+            && addr >= sec.sh_addr.get()
+            && addr < sec.sh_addr.get().saturating_add(sec.sh_size.get())
+    })
+}
+
+fn image_u32(bytes: &[u8], addr: u64) -> Option<u32> {
+    let obj = ObjectFile::parse(bytes).ok()?;
+    for sec in obj.sections() {
+        let base = sec.sh_addr.get();
+        let end = base.saturating_add(sec.sh_size.get());
+        if addr < base || addr.saturating_add(4) > end {
+            continue;
+        }
+        let at = usize::try_from(addr - base).ok()?;
+        let Ok(data) = obj.section_data(sec) else {
+            continue;
+        };
+        if let Some(cell) = data.get(at..at.checked_add(4)?) {
+            return Some(u32::from_le_bytes(cell.try_into().ok()?));
+        }
+    }
+    None
 }
 
 /// Whether `.dynsym` (read via `.dynstr`) contains a symbol named `name`.

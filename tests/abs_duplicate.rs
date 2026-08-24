@@ -14,6 +14,8 @@
 //! refused. Disagreeing values are still an error: that is a genuine
 //! contradiction, and the fix keeps it one.
 //!
+//! On arm64 macOS the agreement case is linked as a native dynamic Mach-O
+//! image and executed; other hosts retain the original x86_64 ELF fixture.
 //! Gated on `clang`; if it is missing the tests print a note and return.
 
 use std::{
@@ -22,7 +24,7 @@ use std::{
     process::Command,
 };
 
-use common::which;
+use common::{which, xold_bin};
 use xold::{icf::IcfMode, linker::link_to};
 
 mod common;
@@ -31,15 +33,42 @@ mod common;
 #[test]
 #[cfg_attr(miri, ignore = "needs the host toolchain, which Miri cannot spawn")]
 fn same_value_absolute_definitions_link() {
+    same_value_link();
+}
+
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+fn same_value_link() {
     let Some(dir) = workdir("same") else {
         return;
     };
-    let Some([a, b]) = build(&dir, "42", "42") else {
+    let Some([a, b]) = build_elf(&dir, "42", "42") else {
         return;
     };
     let out = dir.join("prog");
     let res = link_to(&[a, b], &out, b"start", false, IcfMode::None, false);
     assert!(res.is_ok(), "agreement is not a conflict: {:?}", res.err());
+    assert_eq!(read_answer(&out), 42, "the value both files stated");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn same_value_link() {
+    let Some(dir) = workdir("same") else {
+        return;
+    };
+    let Some([a, b]) = build_macho(&dir, "42", "42") else {
+        return;
+    };
+    let out = dir.join("prog");
+    let linked = Command::new(xold_bin())
+        .args([a.as_os_str(), b.as_os_str()])
+        .args(["-o"])
+        .arg(&out)
+        .args(["-arch", "arm64", "-dynamic"])
+        .status()
+        .expect("run xold")
+        .success();
+    assert!(linked, "agreement is not a conflict");
     assert_eq!(read_answer(&out), 42, "the value both files stated");
     let _ = fs::remove_dir_all(&dir);
 }
@@ -51,7 +80,7 @@ fn different_values_still_collide() {
     let Some(dir) = workdir("clash") else {
         return;
     };
-    let Some([a, b]) = build(&dir, "42", "43") else {
+    let Some([a, b]) = build_elf(&dir, "42", "43") else {
         return;
     };
     let out = dir.join("prog");
@@ -82,7 +111,7 @@ fn workdir(prefix: &str) -> Option<PathBuf> {
 
 /// Builds two objects that each define `answer` as `SHN_ABS` with the given
 /// value, plus the tiny entry point the link needs.
-fn build(dir: &Path, first: &str, second: &str) -> Option<[PathBuf; 2]> {
+fn build_elf(dir: &Path, first: &str, second: &str) -> Option<[PathBuf; 2]> {
     let clang = which("clang")?;
     let a = assemble(
         dir,
@@ -98,6 +127,8 @@ start:
     syscall
 ",
         first,
+        "--target=x86_64-linux-gnu",
+        &["-fno-pie"],
     )?;
     let b = assemble(
         dir,
@@ -108,6 +139,46 @@ start:
 answer = ~
 ",
         second,
+        "--target=x86_64-linux-gnu",
+        &["-fno-pie"],
+    )?;
+    Some([a, b])
+}
+
+/// Builds the native arm64 Mach-O form of the agreement fixture. `_main`
+/// exits through the Darwin syscall ABI so no C runtime or dylib is needed.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn build_macho(dir: &Path, first: &str, second: &str) -> Option<[PathBuf; 2]> {
+    let clang = which("clang")?;
+    let a = assemble(
+        dir,
+        &clang,
+        "a",
+        b"\
+.globl _answer
+_answer = ~
+.globl _main
+.p2align 2
+_main:
+    mov x0, #_answer
+    mov x16, #1
+    svc #0x80
+",
+        first,
+        "--target=arm64-apple-darwin",
+        &[],
+    )?;
+    let b = assemble(
+        dir,
+        &clang,
+        "b",
+        b"\
+.globl _answer
+_answer = ~
+",
+        second,
+        "--target=arm64-apple-darwin",
+        &[],
     )?;
     Some([a, b])
 }
@@ -120,13 +191,17 @@ fn assemble(
     name: &str,
     template: &[u8],
     value: &str,
+    target: &str,
+    extra: &[&str],
 ) -> Option<PathBuf> {
     let src = dir.join(format!("{name}.s"));
     let obj = dir.join(format!("{name}.o"));
     let body = String::from_utf8_lossy(template).replace('~', value);
     fs::write(&src, body).ok()?;
     let built = Command::new(clang)
-        .args(["--target=x86_64-linux-gnu", "-c", "-fno-pie"])
+        .arg(target)
+        .args(extra)
+        .arg("-c")
         .arg(&src)
         .arg("-o")
         .arg(&obj)

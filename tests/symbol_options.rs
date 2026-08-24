@@ -13,7 +13,7 @@ use std::{
     process::Command,
 };
 
-use common::{crt_file, which, xold_bin};
+use common::{archive_tool, crt_file, which, xold_bin};
 
 mod common;
 
@@ -221,7 +221,7 @@ fn symbol_present(path: &Path, name: &str, dynamic: bool) -> bool {
 
 /// Packs `member` into `libextra.a`.
 fn archive(dir: &Path, member: &Path) -> Option<PathBuf> {
-    let ar = which("ar")?;
+    let ar = archive_tool()?;
     let out = dir.join("libextra.a");
     let ok = Command::new(ar)
         .arg("rcs")
@@ -245,7 +245,7 @@ fn compile(
     fs::write(&file, src).ok()?;
     let obj = dir.join(format!("{name}.o"));
     let ok = Command::new(clang)
-        .arg("-c")
+        .args(["--target=x86_64-linux-gnu", "-c"])
         .args(extra)
         .arg(&file)
         .arg("-o")

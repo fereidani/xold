@@ -164,7 +164,7 @@ fn compile(dir: &Path, name: &str, src: &[u8]) -> Option<PathBuf> {
     fs::write(&file, src).ok()?;
     let obj = dir.join(format!("{name}.o"));
     let ok = Command::new(clang)
-        .args(["-c", "-fPIC"])
+        .args(["--target=x86_64-linux-gnu", "-c", "-fPIC"])
         .arg(&file)
         .arg("-o")
         .arg(&obj)

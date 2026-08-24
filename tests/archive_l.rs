@@ -27,7 +27,7 @@ use std::{
     process::Command,
 };
 
-use common::{crt_file, interpreter, libc_so, which};
+use common::{archive_tool, crt_file, interpreter, libc_so, which};
 use xold::{elf::ObjectFile, icf::IcfMode, linker::link_dyn_exec, search};
 
 mod common;
@@ -100,7 +100,7 @@ fn compile(src: &[u8], obj: &Path) -> Option<()> {
 /// Builds `archive` from the listed object files with the host `ar`. Members
 /// are listed in the order given, which controls the archive symbol index.
 fn make_archive(archive: &Path, members: &[&Path]) -> Option<()> {
-    let ar = which("ar")?;
+    let ar = archive_tool()?;
     let dir = archive.parent().expect("archive has a parent");
     let _ = fs::create_dir_all(dir);
     let status = Command::new(ar)
@@ -164,7 +164,7 @@ impl Harness {
             eprintln!("skipping -l archive tests: clang unavailable");
             return None;
         }
-        if which("ar").is_none() {
+        if archive_tool().is_none() {
             eprintln!("skipping -l archive tests: ar unavailable");
             return None;
         }

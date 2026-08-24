@@ -306,6 +306,11 @@ fn shared_lib_exports_resolve_through_dlopen() {
         "no-versioned-deps -shared must omit DT_VERNEED"
     );
 
+    if !cfg!(target_os = "linux") {
+        assert_shared_export_contract(&so);
+        return;
+    }
+
     // The exported symbols must resolve through dlopen/dlsym.
     let probe = dir.join("probe.c");
     fs::write(
@@ -344,6 +349,49 @@ fn shared_lib_exports_resolve_through_dlopen() {
         Some(0),
         "dlopen/dlsym should resolve bump (==6), got {status:?}"
     );
+}
+
+/// Loader-independent proof for a host that cannot dlopen ELF: both names are
+/// defined in the hash-indexed dynamic table, the function has code, and
+/// the exported datum carries the initial value that the first call advances.
+fn assert_shared_export_contract(so: &Path) {
+    let bytes = fs::read(so).expect("read shared object");
+    let obj = ObjectFile::parse(&bytes).expect("valid ELF");
+    let dynsym = obj.dynamic_symbols().expect("read dynsym").expect("dynsym");
+    let bump = dynsym
+        .syms
+        .iter()
+        .find(|sym| dynsym.name(sym) == b"bump")
+        .expect("bump exported");
+    let counter = dynsym
+        .syms
+        .iter()
+        .find(|sym| dynsym.name(sym) == b"counter")
+        .expect("counter exported");
+    assert_eq!(bump.type_(), STT_FUNC, "bump is a callable export");
+    assert_ne!(bump.st_value.get(), 0, "bump has linked code");
+    assert!(
+        obj.sections()
+            .iter()
+            .any(|sec| obj.section_name(sec) == b".gnu.hash"),
+        "the loader can look the exports up by name"
+    );
+
+    let addr = counter.st_value.get();
+    let initial = obj.sections().iter().find_map(|sec| {
+        let base = sec.sh_addr.get();
+        if addr < base
+            || addr.saturating_add(4) > base.saturating_add(sec.sh_size.get())
+        {
+            return None;
+        }
+        let at = usize::try_from(addr - base).ok()?;
+        let data = obj.section_data(sec).ok()?;
+        data.get(at..at + 4)
+            .and_then(|cell| cell.try_into().ok())
+            .map(u32::from_le_bytes)
+    });
+    assert_eq!(initial, Some(5), "counter starts at five before bump");
 }
 
 /// Cross-check against the system linker: both xold's and `clang`'s output

@@ -8,6 +8,7 @@
 
 use std::path::PathBuf;
 
+use common::elf_fixture;
 use rustc_hash::FxHashMap;
 use xold::{
     elf::ObjectFile,
@@ -22,6 +23,8 @@ use xold::{
     },
     symbol::SymbolId,
 };
+
+mod common;
 
 /// A resolver returning fixed addresses for every symbol, for value checks.
 struct Fixed {
@@ -47,10 +50,7 @@ impl Resolver for Fixed {
 }
 
 fn fixture(name: &str) -> PathBuf {
-    let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    p.push("tests/fixtures");
-    p.push(name);
-    p
+    elf_fixture(name)
 }
 
 /// The section index of `.text` in `obj`.

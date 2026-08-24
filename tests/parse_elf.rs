@@ -6,15 +6,16 @@
 
 use std::path::Path;
 
+use common::elf_fixture;
 use xold::{
     elf::{ObjectFile, Rela64, constants::*},
     mmap_file::MappedFile,
 };
 
+mod common;
+
 fn fixture() -> std::path::PathBuf {
-    let mut p = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    p.push("tests/fixtures/min.o");
-    p
+    elf_fixture("min.o")
 }
 
 fn parse_fixture<'a>(path: &'a Path, bytes: &'a [u8]) -> ObjectFile<'a> {

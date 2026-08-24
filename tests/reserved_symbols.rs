@@ -271,7 +271,7 @@ fn compile_pic(src: &str, name: &str, dir: &Path) -> Option<PathBuf> {
     let obj = dir.join(format!("{name}.o"));
     fs::write(&source, src).ok()?;
     let built = Command::new(clang)
-        .args(["-c", "-fPIC"])
+        .args(["--target=x86_64-linux-gnu", "-c", "-fPIC"])
         .arg("-o")
         .arg(&obj)
         .arg(&source)
@@ -314,7 +314,7 @@ fn compile(dir: &Path) -> Option<PathBuf> {
     let obj = dir.join("prog.o");
     fs::write(&src, SRC).ok()?;
     let built = Command::new(clang)
-        .args(["-c", "-fno-pie"])
+        .args(["--target=x86_64-linux-gnu", "-c", "-fno-pie"])
         .arg("-o")
         .arg(&obj)
         .arg(&src)

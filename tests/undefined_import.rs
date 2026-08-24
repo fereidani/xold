@@ -27,7 +27,11 @@ use std::{
 };
 
 use common::{crt_file, interpreter, libc_so, which};
-use xold::{error::Error, icf::IcfMode, linker::link_dyn_exec};
+use xold::{
+    error::Error,
+    icf::IcfMode,
+    linker::{link_dyn_exec, link_shared},
+};
 
 mod common;
 
@@ -43,6 +47,11 @@ const PRESENT: &[u8] = b"extern int abs(int);\n\
 /// resolving it to zero is the answer, not an error.
 const WEAK: &[u8] = b"extern int nowhere_at_all(int) __attribute__((weak));\n\
     int main(void) { return nowhere_at_all ? nowhere_at_all(3) : 0; }\n";
+
+const START: &[u8] = b".globl _start\n_start:\n\
+    call main\n movl %eax, %edi\n movl $60, %eax\n syscall\n";
+
+const ABS_DEP: &[u8] = b"int abs(int x) { return x < 0 ? -x : x; }\n";
 
 #[test]
 #[cfg_attr(miri, ignore = "needs the host toolchain, which Miri cannot spawn")]
@@ -92,6 +101,32 @@ fn link(dir: &Path, src: &[u8]) -> Result<(), Error> {
     let obj = dir.join("u.o");
     compile(src, &obj)
         .ok_or(Error::Format("clang could not build the input"))?;
+    if !cfg!(target_os = "linux") {
+        let start = dir.join("start.o");
+        assemble(START, &start)
+            .ok_or(Error::Format("clang could not build _start"))?;
+        let dep_obj = dir.join("abs.o");
+        compile_pic(ABS_DEP, &dep_obj)
+            .ok_or(Error::Format("clang could not build dependency"))?;
+        let dep = dir.join("libc-standin.so");
+        link_shared(
+            &[dep_obj],
+            &dep,
+            Some(b"libc-standin.so"),
+            false,
+            IcfMode::None,
+            false,
+        )?;
+        return link_dyn_exec(
+            &[obj, start, dep],
+            &dir.join("prog"),
+            b"_start",
+            b"/lib64/ld-linux-x86-64.so.2",
+            false,
+            IcfMode::None,
+            false,
+        );
+    }
     let inputs = vec![
         crt_file("Scrt1.o").ok_or(Error::Format("no Scrt1.o"))?,
         crt_file("crti.o").ok_or(Error::Format("no crti.o"))?,
@@ -113,11 +148,35 @@ fn link(dir: &Path, src: &[u8]) -> Result<(), Error> {
 
 /// Compiles `src` to `obj` with the host `clang`.
 fn compile(src: &[u8], obj: &Path) -> Option<()> {
+    compile_c(src, obj, "-fPIE")
+}
+
+fn compile_pic(src: &[u8], obj: &Path) -> Option<()> {
+    compile_c(src, obj, "-fPIC")
+}
+
+fn compile_c(src: &[u8], obj: &Path, model: &str) -> Option<()> {
     let clang = which("clang")?;
     let src_path = obj.with_extension("c");
     fs::write(&src_path, src).ok()?;
     let ok = Command::new(clang)
-        .args(["--target=x86_64-linux-gnu", "-fPIE", "-O1", "-c"])
+        .args(["--target=x86_64-linux-gnu", model, "-O1", "-c"])
+        .arg(&src_path)
+        .arg("-o")
+        .arg(obj)
+        .status()
+        .ok()?
+        .success();
+    let _ = fs::remove_file(&src_path);
+    ok.then_some(())
+}
+
+fn assemble(src: &[u8], obj: &Path) -> Option<()> {
+    let clang = which("clang")?;
+    let src_path = obj.with_extension("S");
+    fs::write(&src_path, src).ok()?;
+    let ok = Command::new(clang)
+        .args(["--target=x86_64-linux-gnu", "-c"])
         .arg(&src_path)
         .arg("-o")
         .arg(obj)

@@ -140,13 +140,39 @@ fn options_that_name_the_default_behaviour_are_accepted() {
         return;
     };
     assert!(ok, "xold must accept options it already honours: {printed}");
-    let out = Command::new("readelf")
-        .args(["-lW"])
-        .arg(dir.join("prog"))
-        .output()
-        .expect("readelf runs");
+    let bytes = fs::read(dir.join("prog")).expect("read linked image");
     assert!(
-        String::from_utf8_lossy(&out.stdout).contains("GNU_EH_FRAME"),
+        phdr_types(&bytes).contains(&0x6474_e550),
         "--eh-frame-hdr must describe an image that really carries one"
     );
+}
+
+fn phdr_types(bytes: &[u8]) -> Vec<u32> {
+    let phoff = bytes
+        .get(32..40)
+        .and_then(|cell| cell.try_into().ok())
+        .map(u64::from_le_bytes)
+        .and_then(|value| usize::try_from(value).ok())
+        .unwrap_or(0);
+    let entsize = bytes
+        .get(54..56)
+        .and_then(|cell| cell.try_into().ok())
+        .map(u16::from_le_bytes)
+        .map(usize::from)
+        .unwrap_or(0);
+    let count = bytes
+        .get(56..58)
+        .and_then(|cell| cell.try_into().ok())
+        .map(u16::from_le_bytes)
+        .map(usize::from)
+        .unwrap_or(0);
+    (0..count)
+        .filter_map(|i| {
+            let at = phoff.checked_add(i.checked_mul(entsize)?)?;
+            bytes
+                .get(at..at.checked_add(4)?)
+                .and_then(|cell| cell.try_into().ok())
+                .map(u32::from_le_bytes)
+        })
+        .collect()
 }

@@ -21,7 +21,7 @@ use std::{
     process::Command,
 };
 
-use common::which;
+use common::{archive_tool, which};
 use xold::{error::Error, icf::IcfMode, linker::link_to};
 
 mod common;
@@ -71,12 +71,7 @@ fn gc_keeps_a_versioned_definition_the_suffix_names() {
     let prog = dir.join("svl_prog");
     link_to(&[def, start], &prog, b"_start", true, IcfMode::None, false)
         .expect("the versioned reference keeps the defining section alive");
-    let status = Command::new(&prog).status().expect("the program runs");
-    assert_eq!(
-        status.code(),
-        Some(42),
-        "the call must reach the surviving definition's code"
-    );
+    assert_returns_42(&prog);
     let _ = fs::remove_dir_all(&dir);
 }
 
@@ -102,8 +97,7 @@ fn an_archive_member_defining_a_versioned_name_is_extracted() {
     let prog = dir.join("svm_prog");
     link_to(&[start, lib], &prog, b"_start", false, IcfMode::None, false)
         .expect("the archive member defining foo@@VERS_1 must extract");
-    let status = Command::new(&prog).status().expect("the program runs");
-    assert_eq!(status.code(), Some(42), "the extracted member's code runs");
+    assert_returns_42(&prog);
     let _ = fs::remove_dir_all(&dir);
 }
 
@@ -222,9 +216,47 @@ fn symbol_value(bytes: &[u8], name: &[u8]) -> Option<u64> {
         .map(|s| s.st_value.get())
 }
 
+/// Executes the fixture where its ELF architecture is native. Other hosts
+/// verify the same result from the linked `foo` body instead of attempting to
+/// launch a foreign executable.
+fn assert_returns_42(prog: &Path) {
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    {
+        let status = Command::new(prog).status().expect("the program runs");
+        assert_eq!(status.code(), Some(42), "the linked program returns 42");
+    }
+    #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+    {
+        let bytes = fs::read(prog).expect("image is readable");
+        let addr = symbol_value(&bytes, b"foo")
+            .expect("the versioned definition is present under its stem");
+        assert_eq!(
+            image_bytes_at(&bytes, addr, 6).as_deref(),
+            Some(b"\xb8\x2a\0\0\0\xc3".as_slice()),
+            "the surviving or extracted definition returns 42"
+        );
+    }
+}
+
+/// `len` linked bytes at virtual address `addr`.
+#[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+fn image_bytes_at(bytes: &[u8], addr: u64, len: usize) -> Option<Vec<u8>> {
+    let obj = xold::elf::ObjectFile::parse(bytes).ok()?;
+    for sec in obj.sections() {
+        let base = sec.sh_addr.get();
+        if base == 0 || addr < base || addr >= base + sec.sh_size.get() {
+            continue;
+        }
+        let data = obj.section_data(sec).ok()?;
+        let at = usize::try_from(addr - base).ok()?;
+        return data.get(at..at.checked_add(len)?).map(<[u8]>::to_vec);
+    }
+    None
+}
+
 /// Packs `member` into a fresh GNU archive with a real `ar` symbol index.
 fn archive(dir: &Path, member: &Path) -> Option<PathBuf> {
-    let ar = which("ar")?;
+    let ar = archive_tool()?;
     let lib = dir.join("libsvm.a");
     let built = Command::new(ar)
         .arg("rcs")

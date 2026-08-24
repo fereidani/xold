@@ -75,12 +75,13 @@ fn links_pe_importing_msvcrt_printf() {
     assert!(llvm_objdump_lists(&exe, "printf"));
 
     // Runtime proof: the program prints and exits 0.
-    let (code, out) = run_wine(&exe, &dir);
-    assert_eq!(code, 0, "wine exit code");
-    assert!(
-        out.contains("hello from PE"),
-        "wine stdout missing expected output, got: {out:?}"
-    );
+    if let Some((code, out)) = run_wine(&exe, &dir) {
+        assert_eq!(code, 0, "wine exit code");
+        assert!(
+            out.contains("hello from PE"),
+            "wine stdout missing expected output, got: {out:?}"
+        );
+    }
 }
 
 #[test]
@@ -120,16 +121,17 @@ fn links_pe_importing_multiple_dlls() {
     assert!(llvm_objdump_lists(&exe, "msvcrt.dll"));
 
     // Both code paths run: the kernel32 WriteFile line, then the msvcrt line.
-    let (code, out) = run_wine(&exe, &dir);
-    assert_eq!(code, 0, "wine exit code");
-    assert!(
-        out.contains("kernel32 writes"),
-        "wine stdout missing kernel32 output, got: {out:?}"
-    );
-    assert!(
-        out.contains("msvcrt prints 7"),
-        "wine stdout missing msvcrt output, got: {out:?}"
-    );
+    if let Some((code, out)) = run_wine(&exe, &dir) {
+        assert_eq!(code, 0, "wine exit code");
+        assert!(
+            out.contains("kernel32 writes"),
+            "wine stdout missing kernel32 output, got: {out:?}"
+        );
+        assert!(
+            out.contains("msvcrt prints 7"),
+            "wine stdout missing msvcrt output, got: {out:?}"
+        );
+    }
 }
 
 // --- shared helpers -------------------------------------------------------
@@ -205,14 +207,12 @@ fn llvm_objdump_lists(exe: &Path, needle: &str) -> bool {
 }
 
 /// Runs `exe` under wine (if present) and returns `(exit_code, stdout)`.
-/// Returns `(0, String::new())` when wine is absent, so the runtime assertion
-/// is silently skipped rather than failing the build over a missing tool.
 /// The program's stdout is captured into a temp file so wine's own stderr noise
 /// cannot contaminate it.
-fn run_wine(exe: &Path, dir: &Path) -> (i32, String) {
+fn run_wine(exe: &Path, dir: &Path) -> Option<(i32, String)> {
     let Some(wine) = which("wine64").or_else(|| which("wine")) else {
         eprintln!("skipping wine run: wine not installed");
-        return (0, String::new());
+        return None;
     };
     let out_path = dir.join(format!(
         "xold_coff_wine_{}.out",
@@ -242,7 +242,7 @@ fn run_wine(exe: &Path, dir: &Path) -> (i32, String) {
         captured.trim()
     );
     let _ = fs::remove_file(&out_path);
-    (code, captured)
+    Some((code, captured))
 }
 
 // --- tooling helpers ------------------------------------------------------

@@ -8,7 +8,7 @@ use std::{
     process::Command,
 };
 
-use common::which;
+use common::{elf_fixture, which};
 use xold::{
     elf::{ObjectFile, constants::*},
     icf::IcfMode,
@@ -19,10 +19,7 @@ use xold::{
 mod common;
 
 fn fixture(name: &str) -> PathBuf {
-    let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    p.push("tests/fixtures");
-    p.push(name);
-    p
+    elf_fixture(name)
 }
 
 fn temp(name: &str) -> PathBuf {
@@ -45,15 +42,96 @@ fn links_and_runs_a_freestanding_program() {
     )
     .expect("link must succeed");
 
-    let status = Command::new(&out)
-        .status()
-        .expect("linked program must be runnable");
-    assert_eq!(
-        status.code(),
-        Some(6),
-        "entry() should return counter + 1 = 6"
-    );
+    if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        let status = Command::new(&out)
+            .status()
+            .expect("linked program must be runnable");
+        assert_eq!(
+            status.code(),
+            Some(6),
+            "entry() should return counter + 1 = 6"
+        );
+    } else {
+        assert_freestanding_contract(&out);
+    }
     let _ = std::fs::remove_file(&out);
+}
+
+/// Structural equivalent of the foreign ELF run: `counter` starts at five,
+/// `entry` reads, increments, stores, and returns it, and `_start` calls that
+/// function before issuing Linux `exit(60)` with its return value.
+fn assert_freestanding_contract(path: &Path) {
+    let bytes = fs::read(path).expect("read linked executable");
+    let obj = ObjectFile::parse(&bytes).expect("valid ELF executable");
+    let symtab = obj
+        .symbol_table()
+        .expect("symtab readable")
+        .expect("symtab");
+    let value = |name: &[u8]| {
+        symtab
+            .iter()
+            .find(|sym| symtab.name(sym) == name)
+            .map(|sym| sym.st_value.get())
+            .unwrap_or_else(|| {
+                panic!("{} is defined", String::from_utf8_lossy(name))
+            })
+    };
+    let counter = value(b"counter");
+    let entry = value(b"entry");
+    let start = value(b"_start");
+    assert_eq!(obj.header().e_entry.get(), start, "ELF enters at _start");
+    assert_eq!(image_u32(&obj, counter), Some(5), "counter starts at five");
+
+    let entry_body = image_at(&obj, entry, 30).expect("entry body");
+    assert!(
+        entry_body.windows(3).any(|w| w == [0x83, 0xc0, 0x01]),
+        "entry increments the loaded value"
+    );
+    let counter32 = u32::try_from(counter)
+        .expect("counter address fits")
+        .to_le_bytes();
+    assert_eq!(
+        entry_body.windows(4).filter(|w| *w == counter32).count(),
+        3,
+        "entry loads counter, stores it, then loads the result"
+    );
+
+    let start_body = image_at(&obj, start, 14).expect("_start body");
+    let disp = i32::from_le_bytes(
+        start_body[1..5].try_into().expect("call displacement"),
+    );
+    assert_eq!(
+        start
+            .wrapping_add(5)
+            .wrapping_add(i64::from(disp).cast_unsigned()),
+        entry,
+        "_start calls entry"
+    );
+    assert!(
+        start_body.windows(5).any(|w| w == [0xb8, 0x3c, 0, 0, 0])
+            && start_body.windows(2).any(|w| w == [0x0f, 0x05]),
+        "_start performs Linux exit syscall 60"
+    );
+}
+
+fn image_at<'a>(
+    obj: &ObjectFile<'a>,
+    addr: u64,
+    len: usize,
+) -> Option<&'a [u8]> {
+    for sec in obj.sections() {
+        let base = sec.sh_addr.get();
+        if addr < base || addr >= base.saturating_add(sec.sh_size.get()) {
+            continue;
+        }
+        let at = usize::try_from(addr - base).ok()?;
+        return obj.section_data(sec).ok()?.get(at..at.checked_add(len)?);
+    }
+    None
+}
+
+fn image_u32(obj: &ObjectFile<'_>, addr: u64) -> Option<u32> {
+    Some(u32::from_le_bytes(image_at(obj, addr, 4)?.try_into().ok()?))
 }
 
 /// Links `min.o` + `ext.o`, which route `global_counter` access through a GOT

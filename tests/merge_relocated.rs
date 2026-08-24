@@ -27,7 +27,7 @@ use std::{
 };
 
 use common::which;
-use xold::{icf::IcfMode, linker::link_to};
+use xold::{elf::ObjectFile, icf::IcfMode, linker::link_to};
 
 mod common;
 
@@ -136,6 +136,11 @@ fn a_relocated_merge_entry_keeps_its_value() {
         eprintln!("skipping relocated-merge test: host clang unavailable");
         return;
     };
+    if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        assert_relocated_entries(&fs::read(&prog).expect("read linked image"));
+        let _ = fs::remove_dir_all(&dir);
+        return;
+    }
     let status = Command::new(&prog)
         .status()
         .expect("linked program must be runnable");
@@ -145,6 +150,51 @@ fn a_relocated_merge_entry_keeps_its_value() {
         "a relocated .rodata.cst8 entry must survive with its own value"
     );
     let _ = fs::remove_dir_all(&dir);
+}
+
+/// Reproduces all four runtime return conditions directly from the linked
+/// image when the host cannot execute x86_64 ELF.
+fn assert_relocated_entries(bytes: &[u8]) {
+    let obj = ObjectFile::parse(bytes).expect("valid ELF");
+    let symtab = obj.symbol_table().expect("read symtab").expect("symtab");
+    let addr = |name: &[u8]| {
+        symtab
+            .syms
+            .iter()
+            .find(|sym| symtab.name(sym) == name)
+            .map(|sym| sym.st_value.get())
+            .unwrap_or_else(|| {
+                panic!("{} is defined", String::from_utf8_lossy(name))
+            })
+    };
+    let plain = addr(b"plain_entry");
+    let pointer = addr(b"ptr_entry");
+    let target = addr(b"target_value");
+    assert_ne!(plain, pointer, "the two merge entries remain distinct");
+    assert_eq!(
+        image_u64(&obj, pointer),
+        Some(target),
+        "ptr_entry names target_value"
+    );
+    assert_eq!(image_u64(&obj, target), Some(42), "target_value remains 42");
+    assert_eq!(image_u64(&obj, plain), Some(0), "plain_entry remains zero");
+}
+
+fn image_u64(obj: &ObjectFile<'_>, addr: u64) -> Option<u64> {
+    for sec in obj.sections() {
+        let base = sec.sh_addr.get();
+        if addr < base
+            || addr.saturating_add(8) > base.saturating_add(sec.sh_size.get())
+        {
+            continue;
+        }
+        let at = usize::try_from(addr - base).ok()?;
+        let data = obj.section_data(sec).ok()?;
+        return Some(u64::from_le_bytes(
+            data.get(at..at + 8)?.try_into().ok()?,
+        ));
+    }
+    None
 }
 
 /// The same link, twice: declining to merge must be as deterministic as

@@ -45,7 +45,8 @@ fn workdir(prefix: &str) -> PathBuf {
     dir
 }
 
-/// Compiles `src` for `triple` (the host when empty), returning the object.
+/// Compiles `src` for the explicit target in `extra`, or x86_64 ELF by
+/// default, returning the object.
 fn compile(
     dir: &Path,
     name: &str,
@@ -56,7 +57,11 @@ fn compile(
     let file = dir.join(format!("{name}.c"));
     let obj = dir.join(format!("{name}.o"));
     fs::write(&file, src).ok()?;
-    Command::new(clang)
+    let mut command = Command::new(clang);
+    if !extra.iter().any(|arg| arg.starts_with("--target=")) {
+        command.arg("--target=x86_64-linux-gnu");
+    }
+    command
         .args(["-c", "-O1"])
         .args(extra)
         .arg("-o")

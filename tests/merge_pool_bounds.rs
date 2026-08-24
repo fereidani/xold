@@ -76,6 +76,11 @@ fn every_pooled_piece_maps_to_its_own_bytes() {
     let Some(prog) = link(&dir) else {
         return;
     };
+    if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        assert_pool_contract(&fs::read(&prog).expect("read linked image"));
+        let _ = fs::remove_dir_all(&dir);
+        return;
+    }
     let code = Command::new(&prog)
         .status()
         .expect("linked program must run")
@@ -177,4 +182,76 @@ fn rodata(bytes: &[u8]) -> Option<Vec<u8>> {
 /// How many times `needle` appears in `hay`.
 fn occurrences(hay: &[u8], needle: &[u8]) -> usize {
     hay.windows(needle.len()).filter(|w| *w == needle).count()
+}
+
+/// Decodes the immediate pointer each accessor returns, reproducing every
+/// identity and byte comparison in `_start` without executing foreign ELF.
+fn assert_pool_contract(bytes: &[u8]) {
+    let obj = ObjectFile::parse(bytes).expect("valid ELF");
+    let symtab = obj.symbol_table().expect("read symtab").expect("symtab");
+    let accessor = |name: &[u8]| {
+        let addr = symtab
+            .syms
+            .iter()
+            .find(|sym| symtab.name(sym) == name)
+            .map(|sym| sym.st_value.get())
+            .unwrap_or_else(|| {
+                panic!("{} is defined", String::from_utf8_lossy(name))
+            });
+        let body = image_at(&obj, addr, 6).expect("accessor body");
+        assert_eq!(body[0], 0xb8, "accessor returns an immediate pointer");
+        u64::from(u32::from_le_bytes(body[1..5].try_into().unwrap()))
+    };
+    let a1 = accessor(b"a1");
+    let a2 = accessor(b"a2");
+    let a3 = accessor(b"a3");
+    let b1 = accessor(b"b1");
+    let b2 = accessor(b"b2");
+    let b3 = accessor(b"b3");
+    assert_eq!(a1, b1, "shared alpha has one identity");
+    assert_eq!(a2, b2, "shared bravo has one identity");
+    assert_ne!(a3, b3, "the private literals remain distinct");
+    for (addr, want) in [
+        (a1, b"shared alpha".as_slice()),
+        (a2, b"shared bravo"),
+        (a3, b"only in a"),
+        (b3, b"only in b"),
+    ] {
+        assert_eq!(
+            cstring_at(&obj, addr),
+            Some(want),
+            "piece maps to its bytes"
+        );
+    }
+}
+
+fn image_at<'a>(
+    obj: &ObjectFile<'a>,
+    addr: u64,
+    len: usize,
+) -> Option<&'a [u8]> {
+    for sec in obj.sections() {
+        let base = sec.sh_addr.get();
+        if addr < base || addr >= base.saturating_add(sec.sh_size.get()) {
+            continue;
+        }
+        let at = usize::try_from(addr - base).ok()?;
+        return obj.section_data(sec).ok()?.get(at..at.checked_add(len)?);
+    }
+    None
+}
+
+fn cstring_at<'a>(obj: &ObjectFile<'a>, addr: u64) -> Option<&'a [u8]> {
+    for sec in obj.sections() {
+        let base = sec.sh_addr.get();
+        if addr < base || addr >= base.saturating_add(sec.sh_size.get()) {
+            continue;
+        }
+        let data = obj.section_data(sec).ok()?;
+        let at = usize::try_from(addr - base).ok()?;
+        let tail = data.get(at..)?;
+        let end = tail.iter().position(|&byte| byte == 0)?;
+        return Some(&tail[..end]);
+    }
+    None
 }

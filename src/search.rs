@@ -98,6 +98,35 @@ pub fn find_macho_library(
     None
 }
 
+/// Resolves ld64's `-framework name` to the SDK TAPI stub.
+///
+/// Explicit `-F` directories lead, followed by the two conventional framework
+/// roots.  A syslibroot re-roots the conventional absolute paths, while an
+/// explicit framework path keeps the spelling the driver supplied.
+pub fn find_macho_framework(
+    name: &str,
+    search: &[PathBuf],
+    sysroot: Option<&Path>,
+) -> Option<PathBuf> {
+    let look = |dir: &Path| {
+        let path = dir
+            .join(format!("{name}.framework"))
+            .join(format!("{name}.tbd"));
+        path.exists().then_some(path)
+    };
+    for dir in search {
+        if let Some(found) = look(dir) {
+            return Some(found);
+        }
+    }
+    for dir in ["/System/Library/Frameworks", "/Library/Frameworks"] {
+        if let Some(found) = look(&rooted(sysroot, dir)) {
+            return Some(found);
+        }
+    }
+    None
+}
+
 /// Which files a `-l` search will accept.
 ///
 /// A command line switches between the two with `-Bstatic` and `-Bdynamic`,

@@ -164,7 +164,12 @@ pub(super) fn measure_sections(
             }
             cursor = cursor.saturating_add(m.size);
         }
-        rel.set(out.kind, align_up(cursor, align), align);
+        let size = if packed {
+            cursor
+        } else {
+            align_up(cursor, align)
+        };
+        rel.set(out.kind, size, align);
     }
     let common_off = measure_commons(ctx, &mut rel);
     (rel, common_off)

@@ -25,6 +25,7 @@ use crate::{
         MachOFile,
         constants::N_EXT,
         layout::is_linkable,
+        live::LiveSections,
         reloc::{MachoTarget, scan_needs},
     },
 };
@@ -51,12 +52,13 @@ pub enum GotKey<'d> {
 
 impl<'d> GotPlan<'d> {
     /// Walks every linked input section's relocations and records the external
-    /// symbols referenced through a GOT relocation. Deferred sections (unwind,
-    /// DWARF, dynamic-linker tables) are skipped via [`is_linkable`], matching
-    /// the set of sections the writer actually copies.
+    /// symbols referenced through a GOT relocation. Sections the writer does
+    /// not copy are skipped via [`is_linkable`]; compact-unwind personalities
+    /// reserve their indirect pointers in the unwind plan.
     pub fn scan(
         inputs: &'d [MachOFile<'d>],
         target: MachoTarget,
+        live: &LiveSections,
     ) -> Result<Self> {
         let mut keys: Vec<GotKey<'d>> = Vec::new();
         let mut index: FxHashMap<GotKey<'d>, u32> = FxHashMap::default();
@@ -71,7 +73,8 @@ impl<'d> GotPlan<'d> {
                 .map(|(i, s)| key_of(file, i, s.name, s.n_type & N_EXT != 0))
                 .collect();
             for section in input.sections() {
-                if !is_linkable(&section) {
+                if !is_linkable(&section) || !live.section(file, section.index)
+                {
                     continue;
                 }
                 for reloc in &section.relocations {

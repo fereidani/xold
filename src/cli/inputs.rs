@@ -28,6 +28,8 @@ pub struct Inputs {
     pub paths: Vec<PathBuf>,
     pub from_l: Vec<bool>,
     pub search: Vec<PathBuf>,
+    /// The `-F` directories used by ld64's framework search.
+    pub framework_search: Vec<PathBuf>,
     pub sysroot: Option<PathBuf>,
     /// The sysroot came from ld64's `-syslibroot`, so `-l` searches for
     /// Darwin `.tbd`/`.dylib` libraries instead of ELF `.so` files.
@@ -84,6 +86,27 @@ impl Inputs {
         };
         self.paths.push(path);
         self.from_l.push(true);
+        self.as_needed_flags.push(self.as_needed);
+        Ok(())
+    }
+
+    /// A `-framework NAME` dependency, resolved to its SDK `.tbd` stub.
+    pub fn framework(&mut self, name: &str) -> std::result::Result<(), String> {
+        if self.in_lib {
+            return Err(
+                "xold: -framework cannot appear between --start-lib and \
+                 --end-lib"
+                    .into(),
+            );
+        }
+        let path = search::find_macho_framework(
+            name,
+            &self.framework_search,
+            self.sysroot.as_deref(),
+        )
+        .ok_or_else(|| format!("xold: framework not found: {name}"))?;
+        self.paths.push(path);
+        self.from_l.push(false);
         self.as_needed_flags.push(self.as_needed);
         Ok(())
     }
@@ -182,6 +205,30 @@ pub fn parse_search_path(
             search.push(PathBuf::from(next_os(args, i, "-L")?));
         } else if let Some(dir) =
             arg.strip_prefix("-L").filter(|d| !d.is_empty())
+        {
+            search.push(PathBuf::from(dir));
+        }
+        i += 1;
+    }
+    Ok(search)
+}
+
+/// Collects every `-F` framework directory before dependencies are resolved.
+pub fn parse_framework_search_path(
+    args: &[OsString],
+) -> std::result::Result<Vec<PathBuf>, String> {
+    let mut search = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        let Some(arg) = args[i].to_str() else {
+            i += 1;
+            continue;
+        };
+        if arg == "-F" {
+            i += 1;
+            search.push(PathBuf::from(next_os(args, i, "-F")?));
+        } else if let Some(dir) =
+            arg.strip_prefix("-F").filter(|d| !d.is_empty())
         {
             search.push(PathBuf::from(dir));
         }

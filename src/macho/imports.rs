@@ -13,6 +13,7 @@ use crate::{
         LinkOptions, MachOFile,
         constants::{N_EXT, N_TYPE, N_UNDF},
         layout::is_linkable,
+        live::LiveSections,
         reloc::{MachoTarget, scan_needs},
         symtab::Globals,
     },
@@ -41,14 +42,15 @@ impl<'d> ImportPlan<'d> {
         globals: &Globals<'_>,
         target: MachoTarget,
         options: &LinkOptions<'_>,
+        live: &LiveSections,
     ) -> Result<Self> {
         let mut plan = Self {
             imports: Vec::new(),
             index: FxHashMap::default(),
             stub_count: 0,
         };
-        for input in inputs {
-            for sym in input.symbols().iter() {
+        for (file, input) in inputs.iter().enumerate() {
+            for (sym_idx, sym) in input.symbols().iter().enumerate() {
                 if sym.is_stab()
                     || sym.n_type & N_EXT == 0
                     || sym.n_type & N_TYPE != N_UNDF
@@ -56,6 +58,7 @@ impl<'d> ImportPlan<'d> {
                     || sym.name.is_empty()
                     || globals.get(sym.name).is_some()
                     || plan.index.contains_key(sym.name)
+                    || !live.symbol(file, sym_idx)
                 {
                     continue;
                 }
@@ -71,10 +74,11 @@ impl<'d> ImportPlan<'d> {
             }
         }
 
-        for input in inputs {
+        for (file, input) in inputs.iter().enumerate() {
             let symbols: Vec<_> = input.symbols().iter().collect();
             for section in input.sections() {
-                if !is_linkable(&section) {
+                if !is_linkable(&section) || !live.section(file, section.index)
+                {
                     continue;
                 }
                 for reloc in &section.relocations {

@@ -9,7 +9,7 @@ use std::{
     path::Path,
     sync::{
         OnceLock,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU32, Ordering},
     },
 };
 
@@ -122,6 +122,7 @@ fn umask() -> u32 {
 /// The fallback when the line is absent is `0o022`, the near-universal
 /// default; it is also what the fixed `0o755` assumed, so nothing regresses
 /// where the file cannot be read.
+#[cfg(target_os = "linux")]
 fn read_umask() -> u32 {
     const DEFAULT: u32 = 0o022;
     let Ok(status) = std::fs::read_to_string("/proc/self/status") else {
@@ -132,6 +133,36 @@ fn read_umask() -> u32 {
         .find_map(|line| line.strip_prefix("Umask:"))
         .and_then(|v| u32::from_str_radix(v.trim(), 8).ok())
         .unwrap_or(DEFAULT)
+}
+
+/// Reads the umask without changing it on systems without Linux's `/proc`
+/// field. A directory requested as `0777` is created as `0777 & !umask`, so
+/// its resulting mode reveals the mask without racing another thread's file
+/// creation the way a set-and-restore `umask(2)` probe would.
+#[cfg(not(target_os = "linux"))]
+fn read_umask() -> u32 {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    const DEFAULT: u32 = 0o022;
+    static NEXT: AtomicU32 = AtomicU32::new(0);
+    for _ in 0..16 {
+        let id = NEXT.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir()
+            .join(format!(".xold-umask-{}-{id}", std::process::id()));
+        match std::fs::create_dir(&path) {
+            Ok(()) => {
+                let mode = std::fs::metadata(&path)
+                    .map(|meta| meta.permissions().mode() & 0o777)
+                    .unwrap_or(0o777 & !DEFAULT);
+                let _ = std::fs::remove_dir(&path);
+                return 0o777 & !mode;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            }
+            Err(_) => return DEFAULT,
+        }
+    }
+    DEFAULT
 }
 
 /// Writes one `Pod` struct into `image` at `off`.

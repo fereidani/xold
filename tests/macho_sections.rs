@@ -5,9 +5,8 @@
 //! or `__DATA` -- a user's `__attribute__((section("__DATA,__mine")))`, an
 //! `__mod_init_func`, any `__objc_*` -- was dropped with no diagnostic, and a
 //! reference into a dropped section resolved against a base of zero. The
-//! question is which sections the link *defers* (unwind, debug, dynamic-linker
-//! metadata a static image has no use for), so that is what the check asks
-//! now.
+//! question is which sections the link consumes or defers, so that is what
+//! the check asks now.
 //!
 //! `__got` slots were keyed by symbol name alone. A file-private symbol means
 //! nothing outside its own object, so two files' `static counter` shared one
@@ -58,24 +57,24 @@ fn an_unknown_section_is_linked() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-/// The deferred sections are still deferred.
+/// Compact-unwind input is consumed into a runtime index; debug stays out.
 #[test]
 #[cfg_attr(miri, ignore = "needs the host toolchain, which Miri cannot spawn")]
-fn the_deferred_sections_are_still_dropped() {
+fn unwind_input_is_synthesized_and_debug_is_still_dropped() {
     let Some((dir, image)) = link("deferred", &[("u", NAMED)]) else {
         return;
     };
-    for name in [
-        b"__eh_frame".as_slice(),
-        b"__compact_unwind",
-        b"__debug_str",
-    ] {
+    for name in [b"__compact_unwind".as_slice(), b"__debug_str"] {
         assert!(
             section(&image, name).is_none(),
-            "{} needs machinery this phase does not have",
+            "{} is linker input or non-runtime debug data",
             String::from_utf8_lossy(name)
         );
     }
+    assert!(
+        section(&image, b"__unwind_info").is_some(),
+        "compact unwind rows become the runtime index"
+    );
     // And the ordinary ones are still linked.
     assert!(section(&image, b"__text").is_some(), "__text is linked");
     let _ = fs::remove_dir_all(&dir);

@@ -217,8 +217,15 @@ impl Write {
 pub enum WriteKind {
     /// One byte, unsigned.
     W8,
+    /// One byte, signed.
+    W8S,
+    /// One byte, signed or unsigned: the value is accepted if it fits either
+    /// 8-bit range, after lld's `checkIntUInt`.
+    W8SU,
     /// Two bytes, unsigned.
     W16,
+    /// Two bytes, signed.
+    W16S,
     /// Two bytes, signed or unsigned: the value is accepted if it fits either
     /// 16-bit range, after lld's `checkIntUInt`.
     W16SU,
@@ -239,8 +246,8 @@ impl WriteKind {
     /// The number of output bytes this kind occupies.
     pub const fn width(self) -> usize {
         match self {
-            Self::W8 => 1,
-            Self::W16 | Self::W16SU => 2,
+            Self::W8 | Self::W8S | Self::W8SU => 1,
+            Self::W16 | Self::W16S | Self::W16SU => 2,
             Self::W32 | Self::W32S | Self::W32SU => 4,
             Self::W64 => 8,
         }
@@ -254,8 +261,11 @@ impl WriteKind {
             Self::W16 => value <= u16::MAX as u64,
             Self::W8 => value <= u8::MAX as u64,
             Self::W32S => fits_signed(value, 32),
+            Self::W16S => fits_signed(value, 16),
+            Self::W8S => fits_signed(value, 8),
             Self::W32SU => value <= u32::MAX as u64 || fits_signed(value, 32),
             Self::W16SU => value <= u16::MAX as u64 || fits_signed(value, 16),
+            Self::W8SU => value <= u8::MAX as u64 || fits_signed(value, 8),
         }
     }
 
@@ -265,9 +275,9 @@ impl WriteKind {
         match self {
             // Truncation is sound: `fits` has bounded the value to this width.
             #[allow(clippy::cast_possible_truncation)]
-            Self::W8 => out[0] = value as u8,
+            Self::W8 | Self::W8S | Self::W8SU => out[0] = value as u8,
             #[allow(clippy::cast_possible_truncation)]
-            Self::W16 | Self::W16SU => {
+            Self::W16 | Self::W16S | Self::W16SU => {
                 out.copy_from_slice(&(value as u16).to_le_bytes());
             }
             #[allow(clippy::cast_possible_truncation)]

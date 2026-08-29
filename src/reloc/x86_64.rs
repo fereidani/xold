@@ -219,12 +219,20 @@ impl Arch for X86_64 {
             // The narrow widths. lld classifies and writes all of them; here
             // they were falling to `UnsupportedReloc`, so an object with a
             // byte-sized absolute constant refused to link at all.
-            R_X86_64_8 => of(RelExpr::Abs, WriteKind::W8),
-            R_X86_64_PC8 => of(RelExpr::Pc, WriteKind::W8),
-            R_X86_64_PC16 => of(RelExpr::Pc, WriteKind::W16SU),
+            //
+            // The ranges are lld's, from `X86_64::relocate`: the absolute
+            // byte takes `checkIntUInt` because a small negative constant and
+            // a small address are both legal in one slot, while the two
+            // PC-relative widths take a plain signed `checkInt` -- a backward
+            // branch is negative, and a displacement above the signed range
+            // is an overflow rather than a large unsigned offset.
+            R_X86_64_8 => of(RelExpr::Abs, WriteKind::W8SU),
+            R_X86_64_PC8 => of(RelExpr::Pc, WriteKind::W8S),
+            R_X86_64_PC16 => of(RelExpr::Pc, WriteKind::W16S),
             // `sizeof` an object whose definition the compiler could not see:
-            // the value is the symbol's `st_size`, not its address.
-            R_X86_64_SIZE32 => of(RelExpr::Size, WriteKind::W32),
+            // the value is the symbol's `st_size`, not its address. Signed,
+            // because `sym@SIZE - k` is how a smaller size is spelled.
+            R_X86_64_SIZE32 => of(RelExpr::Size, WriteKind::W32S),
             R_X86_64_SIZE64 => of(RelExpr::Size, WriteKind::W64),
             // The large code model (`-mcmodel=large -fPIC`). Every one of
             // these is an existing expression at 64-bit width: the GOT slot's
@@ -244,7 +252,9 @@ impl Arch for X86_64 {
             | R_X86_64_CODE_6_GOTPC32_TLSDESC => {
                 of(RelExpr::Escape, WriteKind::W32S)
             }
-            R_X86_64_GOT32 => of(RelExpr::GotOffset, WriteKind::W32),
+            // Signed: the slot holds the symbol's offset from the GOT base,
+            // which is negative for a slot below it (lld `checkInt`).
+            R_X86_64_GOT32 => of(RelExpr::GotOffset, WriteKind::W32S),
             R_X86_64_GOT64 => of(RelExpr::GotOffset, WriteKind::W64),
             R_X86_64_GOTPCREL64 => of(RelExpr::GotPc, WriteKind::W64),
             R_X86_64_GOTPC64 => of(RelExpr::GotBase, WriteKind::W64),

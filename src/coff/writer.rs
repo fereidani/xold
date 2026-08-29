@@ -468,6 +468,7 @@ fn collect_reloc_sites(
     if target != CoffTarget::X86_64 {
         return Vec::new();
     }
+    let absolute = absolute_symbols(inputs);
     let mut sites = Vec::new();
     for (file, section_ordinal, section_rva, member_off) in
         build_section_map(layout)
@@ -479,15 +480,49 @@ fn collect_reloc_sites(
             continue;
         };
         for reloc in &section.relocations {
-            if u32::from(reloc.typ) == IMAGE_REL_AMD64_ADDR64 {
-                let rva = section_rva
-                    .wrapping_add(u32::try_from(member_off).unwrap_or(0))
-                    .wrapping_add(reloc.virtual_address);
-                sites.push(rva);
+            if u32::from(reloc.typ) != IMAGE_REL_AMD64_ADDR64 {
+                continue;
             }
+            // An absolute symbol is a constant, not an address, so the
+            // loader must not add the base delta to it.
+            if absolute.get(file).is_some_and(|indices| {
+                indices.binary_search(&reloc.symbol_table_index).is_ok()
+            }) {
+                continue;
+            }
+            let rva = section_rva
+                .wrapping_add(u32::try_from(member_off).unwrap_or(0))
+                .wrapping_add(reloc.virtual_address);
+            sites.push(rva);
         }
     }
     sites
+}
+
+/// The symbol-table index of every absolute symbol in each input, ascending
+/// so a site can be tested with a binary search.
+///
+/// An `IMAGE_SYM_ABSOLUTE` symbol holds a constant rather than an address:
+/// its value means the same wherever the image loads, so a `.reloc` entry
+/// naming one has the loader add the base delta to a number that was never a
+/// pointer. lld skips a `DefinedAbsolute` target when it collects base
+/// relocations (`lld/COFF/Chunks.cpp`), and so does this.
+fn absolute_symbols(inputs: &[CoffFile<'_>]) -> Vec<Vec<u32>> {
+    inputs
+        .iter()
+        .map(|input| {
+            let mut indices: Vec<u32> = input
+                .symbols()
+                .iter()
+                .filter(|sym| sym.is_absolute())
+                .map(|sym| sym.index)
+                .collect();
+            // `symbols()` yields ascending indices already; the sort states
+            // the invariant the binary search depends on.
+            indices.sort_unstable();
+            indices
+        })
+        .collect()
 }
 
 /// The DLL the entry stub terminates through, plus its imported function.

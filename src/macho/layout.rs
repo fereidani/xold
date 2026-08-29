@@ -701,11 +701,28 @@ impl OutSection {
 /// final-image DWARF unwind data; debug and input dynamic-linker
 /// symbol-pointer / stub sections are deferred.
 pub fn is_linkable(section: &MachSection<'_>) -> bool {
-    let seg = section.segname;
-    if seg != b"__TEXT" && seg != b"__DATA" {
+    if !is_content_segment(section.segname) {
         return false;
     }
     !is_deferred(section.sectname)
+}
+
+/// Whether a segment holds content the image loads, as opposed to metadata
+/// the link consumes (`__DWARF`, `__LD`, `__LLVM`).
+///
+/// `__DATA_CONST` and `__DATA_DIRTY` are ordinary data segments that clang
+/// emits routinely -- const globals, vtables and relocated pointers live in
+/// the first of them -- so accepting only `__TEXT` and `__DATA` dropped real
+/// data with no diagnostic, leaving every reference to it resolving through a
+/// section that was never placed. lld gives each its own output segment
+/// (`lld/MachO/OutputSegment.h`); this places their content in `__DATA`,
+/// which costs the separate const page protection and keeps the bytes and
+/// their addresses.
+fn is_content_segment(segname: &[u8]) -> bool {
+    matches!(
+        segname,
+        b"__TEXT" | b"__DATA" | b"__DATA_CONST" | b"__DATA_DIRTY"
+    )
 }
 
 /// Sections consumed or synthesized elsewhere, debug tables, and input

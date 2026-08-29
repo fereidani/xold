@@ -124,68 +124,9 @@ fn run(opts: &Options) -> Result<()> {
     check_command_line(opts, inputs)?;
     let files = list.views();
     // Mach-O inputs take a separate link path; the ELF linker cannot consume
-    // them. Darwin executables conventionally enter at `_main`, while dylibs
-    // have no entry point.
+    // them.
     if inputs.macho {
-        refuse_elf_only(opts, "Mach-O")?;
-        if opts.shared {
-            return Err(unsupported("-shared".into(), "Mach-O"));
-        }
-        if opts.macho_install_name.is_some() && !opts.macho_dylib {
-            return Err(unsupported("-install_name".into(), "MH_EXECUTE"));
-        }
-        if opts.macho_exported_symbols.is_some() && !opts.macho_dynamic {
-            return Err(unsupported(
-                "-exported_symbols_list".into(),
-                "static Mach-O",
-            ));
-        }
-        let entry = if opts.macho_dylib {
-            b"".as_slice()
-        } else {
-            default_entry(opts, b"_main")
-        };
-        let install_name = if opts.macho_dylib {
-            Some(opts.macho_install_name.as_deref().map_or_else(
-                || {
-                    opts.output.to_str().ok_or_else(|| {
-                        Error::CommandLine(
-                            "Mach-O dylib output path is not valid UTF-8; \
-                                 use -install_name to give LC_ID_DYLIB a name"
-                                .into(),
-                        )
-                    })
-                },
-                Ok,
-            )?)
-        } else {
-            None
-        };
-        let exported_symbols = read_macho_exported_symbols(opts)?;
-        let dylibs: Vec<Dylib<'_>> = list
-            .dylibs
-            .iter()
-            .map(|dylib| Dylib {
-                install_name: &dylib.install_name,
-                exports: &dylib.exports,
-            })
-            .collect();
-        link_macho_with_options(
-            &files,
-            &opts.output,
-            entry,
-            &MachOLinkOptions {
-                arch: opts.macho_arch,
-                dynamic: opts.macho_dynamic,
-                dylib: opts.macho_dylib,
-                install_name,
-                exported_symbols: exported_symbols.as_deref(),
-                platform: opts.macho_platform,
-                dead_strip: opts.macho_dead_strip,
-                dylibs: &dylibs,
-            },
-        )?;
-        return ad_hoc_sign(&opts.output);
+        return link_macho_image(opts, &list, &files);
     }
     // COFF inputs (Windows objects) take a separate link path that produces a
     // PE32+ image; the ELF linker cannot consume them. Windows C programs
@@ -345,6 +286,78 @@ fn refuse_elf_only(opts: &Options, format: &'static str) -> Result<()> {
         return Err(unsupported("-pie/-no-pie".into(), format));
     }
     Ok(())
+}
+
+/// Links Mach-O inputs into an executable or a dylib, then signs the result.
+///
+/// Darwin executables conventionally enter at `_main`. A dylib has no entry
+/// point and carries `LC_ID_DYLIB` instead, so it needs an install name: the
+/// one `-install_name` gave, or the output path when the command line left it
+/// to the linker.
+fn link_macho_image(
+    opts: &Options,
+    list: &InputList,
+    files: &[Input<'_>],
+) -> Result<()> {
+    refuse_elf_only(opts, "Mach-O")?;
+    if opts.shared {
+        return Err(unsupported("-shared".into(), "Mach-O"));
+    }
+    if opts.macho_install_name.is_some() && !opts.macho_dylib {
+        return Err(unsupported("-install_name".into(), "MH_EXECUTE"));
+    }
+    if opts.macho_exported_symbols.is_some() && !opts.macho_dynamic {
+        return Err(unsupported(
+            "-exported_symbols_list".into(),
+            "static Mach-O",
+        ));
+    }
+    let entry = if opts.macho_dylib {
+        b"".as_slice()
+    } else {
+        default_entry(opts, b"_main")
+    };
+    let install_name = if opts.macho_dylib {
+        Some(opts.macho_install_name.as_deref().map_or_else(
+            || {
+                opts.output.to_str().ok_or_else(|| {
+                    Error::CommandLine(
+                        "Mach-O dylib output path is not valid UTF-8; use \
+                         -install_name to give LC_ID_DYLIB a name"
+                            .into(),
+                    )
+                })
+            },
+            Ok,
+        )?)
+    } else {
+        None
+    };
+    let exported_symbols = read_macho_exported_symbols(opts)?;
+    let dylibs: Vec<Dylib<'_>> = list
+        .dylibs
+        .iter()
+        .map(|dylib| Dylib {
+            install_name: &dylib.install_name,
+            exports: &dylib.exports,
+        })
+        .collect();
+    link_macho_with_options(
+        files,
+        &opts.output,
+        entry,
+        &MachOLinkOptions {
+            arch: opts.macho_arch,
+            dynamic: opts.macho_dynamic,
+            dylib: opts.macho_dylib,
+            install_name,
+            exported_symbols: exported_symbols.as_deref(),
+            platform: opts.macho_platform,
+            dead_strip: opts.macho_dead_strip,
+            dylibs: &dylibs,
+        },
+    )?;
+    ad_hoc_sign(&opts.output)
 }
 
 /// Refuses Mach-O output controls when another format's inputs selected its

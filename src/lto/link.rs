@@ -16,7 +16,10 @@
 use rustc_hash::FxHashMap;
 
 use crate::{
-    elf::{ObjectFile, constants::SHN_UNDEF},
+    elf::{
+        ObjectFile,
+        constants::{SHN_COMMON, SHN_UNDEF, STB_WEAK},
+    },
     error::{Error, Result},
     input::{Format, InputFile},
     lto::{
@@ -45,8 +48,15 @@ struct Use {
     /// A regular object names it, or the command line pinned it. This is
     /// lld's `isUsedInRegularObj`.
     used: bool,
-    /// A regular object defines it, so no bitcode definition can prevail.
-    defined: bool,
+    /// The rank of the strongest regular definition of this name, in the
+    /// order [`rank`] puts bitcode definitions in so the two compare
+    /// directly, or `None` when no regular object defines it.
+    ///
+    /// The strength matters: a *weak* regular definition loses to a strong
+    /// bitcode one, and treating any definition at all as blocking told the
+    /// plugin its strong definition had been preempted, which lets LLVM drop
+    /// the body the image was supposed to keep.
+    def_rank: Option<u8>,
     /// A shared library defines it, and nothing else does.
     shared: bool,
 }
@@ -90,10 +100,12 @@ impl Regular {
         let file =
             InputFile::from_member(std::path::Path::new("(lto)"), bytes)?;
         for sym in file.global_symbols()? {
+            let rank = regular_rank(sym.binding, sym.shndx);
             let slot = self.entry(sym.name);
             slot.used = true;
             if sym.shndx != SHN_UNDEF {
-                slot.defined = true;
+                slot.def_rank =
+                    Some(slot.def_rank.map_or(rank, |best| best.min(rank)));
             }
         }
         Ok(())
@@ -133,7 +145,7 @@ impl Regular {
         let mut out: FxHashMap<Vec<u8>, bool> = FxHashMap::default();
         for (name, seen) in &self.names {
             if seen.used {
-                out.insert(name.clone(), seen.defined);
+                out.insert(name.clone(), seen.def_rank.is_some());
             }
         }
         for file in &state.claimed {
@@ -182,6 +194,18 @@ const fn rank(kind: std::ffi::c_uint) -> u8 {
     }
 }
 
+/// The rank of a regular ELF definition, in the same order [`rank`] puts
+/// bitcode definitions in so that the two can be compared directly.
+const fn regular_rank(binding: u8, shndx: u16) -> u8 {
+    if shndx == SHN_COMMON {
+        2
+    } else if binding == STB_WEAK {
+        3
+    } else {
+        1
+    }
+}
+
 /// Whether a declared symbol is a definition rather than a reference.
 const fn is_definition(kind: std::ffi::c_uint) -> bool {
     matches!(kind, LDPK_DEF | LDPK_WEAKDEF | LDPK_COMMON)
@@ -226,7 +250,15 @@ pub fn resolve_claimed(regular: &Regular, export_all: bool) -> Result<()> {
             let seen = regular.get(&sym.name);
             let defined = is_definition(sym.kind);
             let owner = winner.get(&sym.name).map(|(_, handle)| *handle);
-            let where_ = if seen.defined {
+            // A regular definition only displaces the bitcode one when it
+            // would win the ordinary resolution. Equal ranks go to the
+            // regular object, which was added to the link first. lld reaches
+            // the same answer from the other side: it derives `Prevailing`
+            // from whichever symbol the resolver already chose
+            // (`lld/ELF/LTO.cpp`).
+            let outranked =
+                seen.def_rank.is_some_and(|best| best <= rank(sym.kind));
+            let where_ = if outranked {
                 Winner::Regular
             } else if owner.is_some() {
                 Winner::Bitcode
@@ -237,9 +269,7 @@ pub fn resolve_claimed(regular: &Regular, export_all: bool) -> Result<()> {
             };
             let facts = Facts {
                 defined,
-                prevailing: defined
-                    && !seen.defined
-                    && owner == Some(file.handle),
+                prevailing: defined && !outranked && owner == Some(file.handle),
                 winner: where_,
                 used_in_regular_obj: seen.used,
                 exported: export_all && sym.visibility == LDPV_DEFAULT,

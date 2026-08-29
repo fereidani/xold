@@ -16,6 +16,7 @@ pub struct Stub {
 }
 
 /// Parses one `.tbd`, including all YAML documents concatenated within it.
+///
 /// Re-export documents are intentionally folded into the same symbol set:
 /// an umbrella such as libSystem makes those names available through its own
 /// install name.

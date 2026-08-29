@@ -695,9 +695,11 @@ impl OutSection {
     }
 }
 
-/// Whether an input section is linked into the output. Code, read-only data
-/// and `__DATA` content are linked, including final-image DWARF unwind data;
-/// debug and input dynamic-linker symbol-pointer / stub sections are deferred.
+/// Whether an input section is linked into the output.
+///
+/// Code, read-only data and `__DATA` content are linked, including
+/// final-image DWARF unwind data; debug and input dynamic-linker
+/// symbol-pointer / stub sections are deferred.
 pub fn is_linkable(section: &MachSection<'_>) -> bool {
     let seg = section.segname;
     if seg != b"__TEXT" && seg != b"__DATA" {

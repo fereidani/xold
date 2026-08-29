@@ -96,7 +96,7 @@ pub fn reserve_personality_got<'d>(
             }
             for reloc in section.relocations {
                 if reloc.r_extern
-                    && reloc.r_address % COMPACT_ENTRY_SIZE as u32 == 16
+                    && reloc.r_address as usize % COMPACT_ENTRY_SIZE == 16
                     && live.symbol(file, reloc.r_symbolnum as usize)
                     && let Some(sym) = symbols.get(reloc.r_symbolnum as usize)
                     && !sym.name.is_empty()

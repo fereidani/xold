@@ -55,7 +55,7 @@ impl LiveSections {
         live.root_name(inputs, globals, entry, &mut work);
         if options.dylib && options.exported_symbols.is_none() {
             for (file, input) in inputs.iter().enumerate() {
-                for sym in input.symbols().iter() {
+                for sym in &input.symbols() {
                     if sym.n_type & (N_EXT | N_PEXT) == N_EXT
                         && sym.n_type & N_TYPE == N_SECT
                     {
@@ -170,7 +170,7 @@ impl LiveSections {
             return;
         }
         for (file, input) in inputs.iter().enumerate() {
-            for sym in input.symbols().iter() {
+            for sym in &input.symbols() {
                 if sym.name == name && sym.n_type & N_TYPE == N_SECT {
                     self.mark(file, u32::from(sym.n_sect), work);
                 }
@@ -232,14 +232,14 @@ impl LiveSections {
                     && section.sectname == b"__compact_unwind"
                 {
                     for reloc in section.relocations {
-                        if reloc.r_extern && reloc.r_address % 32 == 16 {
-                            if let Some(slot) =
+                        if reloc.r_extern
+                            && reloc.r_address % 32 == 16
+                            && let Some(slot) =
                                 self.symbols.get_mut(file).and_then(|row| {
                                     row.get_mut(reloc.r_symbolnum as usize)
                                 })
-                            {
-                                *slot = true;
-                            }
+                        {
+                            *slot = true;
                         }
                     }
                 }

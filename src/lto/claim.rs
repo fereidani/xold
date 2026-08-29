@@ -115,6 +115,10 @@ fn register(path: &Path, bytes: Vec<u8>) -> Result<usize> {
         bytes,
         symbols: Vec::new(),
     });
+    // Released here rather than at the end of the scope: the plugin calls
+    // this from its own threads, so the lock is held for the push and no
+    // longer.
+    drop(state);
     Ok(handle)
 }
 

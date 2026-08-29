@@ -209,21 +209,25 @@ impl Regular {
     ///
     /// Reports a poisoned session lock.
     pub fn undefined(&self) -> Result<Vec<Vec<u8>>> {
-        let state = session::session()
-            .lock()
-            .map_err(|_| Error::Format("LTO session lock was poisoned"))?;
+        // What the regular half knows needs no lock, so it is gathered first
+        // and the session is held only for the claimed symbols.
         let mut out: FxHashMap<Vec<u8>, bool> = FxHashMap::default();
         for (name, seen) in &self.names {
             if seen.used {
                 out.insert(name.clone(), seen.def_rank.is_some());
             }
         }
-        for file in &state.claimed {
-            for sym in &file.symbols {
-                if is_definition(sym.kind) {
-                    out.insert(sym.name.clone(), true);
-                } else if sym.kind != LDPK_WEAKUNDEF {
-                    out.entry(sym.name.clone()).or_insert(false);
+        {
+            let state = session::session()
+                .lock()
+                .map_err(|_| Error::Format("LTO session lock was poisoned"))?;
+            for file in &state.claimed {
+                for sym in &file.symbols {
+                    if is_definition(sym.kind) {
+                        out.insert(sym.name.clone(), true);
+                    } else if sym.kind != LDPK_WEAKUNDEF {
+                        out.entry(sym.name.clone()).or_insert(false);
+                    }
                 }
             }
         }
@@ -354,5 +358,8 @@ pub fn resolve_claimed(regular: &Regular, export_all: bool) -> Result<()> {
             sym.resolution = resolution(&facts).cast_signed();
         }
     }
+    // Released before returning: the caller goes on to run codegen, which the
+    // plugin drives from its own threads.
+    drop(state);
     Ok(())
 }

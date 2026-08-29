@@ -128,40 +128,52 @@ pub struct MachLayout {
     pub common_addr: Vec<u64>,
 }
 
+/// The content the layout synthesises rather than copies from an input.
+///
+/// The four travel together because each one decides whether a section
+/// exists at all, and the layout has to know all of them before it places
+/// anything.
+#[derive(Clone, Copy, Default)]
+pub struct Synthetic<'a> {
+    /// `__got` slots to allocate, for external symbols referenced through a
+    /// GOT relocation. Zero emits no `__got` section.
+    pub got: u32,
+    /// `__stubs` entries, one per imported function called directly.
+    pub stubs: u32,
+    /// `__unwind_info` entries. Zero emits no compact-unwind index.
+    pub unwind: u32,
+    /// The merged tentative definitions, which a non-empty list turns into a
+    /// synthetic `__common` zero-fill section.
+    pub commons: &'a [CommonSym<'a>],
+}
+
 /// Builds the layout for `inputs`.
 ///
 /// `linkedit_size` is the `__LINKEDIT` content size (symtab + strtab),
-/// precomputed. `entry` names the entry symbol. `got_count` is the number of
-/// `__got` slots to allocate (external symbols referenced through a GOT
-/// relocation); zero emits no `__got` section. `commons` is the merged
-/// tentative-definition list, which a non-empty turn into a synthetic
-/// `__common` zero-fill section.
+/// precomputed. `entry` names the entry symbol.
 pub fn build(
     inputs: &[MachOFile<'_>],
     linkedit_size: u64,
     entry: &[u8],
-    got_count: u32,
-    commons: &[CommonSym<'_>],
+    synthetic: &Synthetic<'_>,
     target: MachoTarget,
     options: &LinkOptions<'_>,
-    stub_count: u32,
-    unwind_entries: u32,
     live: &LiveSections,
 ) -> Result<MachLayout> {
     let mut text_secs = Vec::new();
     let mut data_secs = Vec::new();
     collect_sections(inputs, live, &mut text_secs, &mut data_secs);
-    if unwind_entries > 0 {
-        inject_unwind_info(&mut text_secs, unwind_entries);
+    if synthetic.unwind > 0 {
+        inject_unwind_info(&mut text_secs, synthetic.unwind);
     }
-    if stub_count > 0 {
-        inject_stubs(&mut text_secs, stub_count);
+    if synthetic.stubs > 0 {
+        inject_stubs(&mut text_secs, synthetic.stubs);
     }
-    if got_count > 0 {
-        inject_got_section(&mut data_secs, got_count, stub_count);
+    if synthetic.got > 0 {
+        inject_got_section(&mut data_secs, synthetic.got, synthetic.stubs);
     }
-    if !commons.is_empty() {
-        inject_common_section(&mut data_secs, commons);
+    if !synthetic.commons.is_empty() {
+        inject_common_section(&mut data_secs, synthetic.commons);
     }
 
     let nsects_text = u32::try_from(text_secs.len())
@@ -188,7 +200,7 @@ pub fn build(
     };
     let got = find_got(data.as_ref());
     let stubs = find_stubs(&text);
-    let common_addr = common_addresses(data.as_ref(), commons);
+    let common_addr = common_addresses(data.as_ref(), synthetic.commons);
     Ok(MachLayout {
         text,
         data,

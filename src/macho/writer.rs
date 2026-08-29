@@ -141,18 +141,7 @@ fn write_executable(
     entry: &[u8],
     options: &LinkOptions<'_>,
 ) -> Result<Vec<u8>> {
-    if options.dylib && (!options.dynamic || options.install_name.is_none()) {
-        return Err(Error::CommandLine(
-            "a Mach-O dylib requires dynamic linking and an install name"
-                .into(),
-        ));
-    }
-    let target = derive_target(inputs)?;
-    if options.arch.is_some_and(|arch| arch != target) {
-        return Err(Error::CommandLine(
-            "-arch disagrees with the Mach-O input objects".into(),
-        ));
-    }
+    let target = link_target(inputs, options)?;
     let globals = Globals::build(inputs)?;
     let live = LiveSections::build(inputs, &globals, entry, options);
     let unwind_entries = unwind::entry_capacity(inputs, &live);
@@ -171,16 +160,19 @@ fn write_executable(
     let streams_relative = plan
         .linkedit_size()
         .saturating_add(u64::from(indirect_count) * 4);
+    let synthetic = layout::Synthetic {
+        got: got_plan.count(),
+        stubs: imports.stub_count(),
+        unwind: unwind_entries,
+        commons: &globals.commons,
+    };
     let provisional = layout::build(
         inputs,
         streams_relative,
         entry,
-        got_plan.count(),
-        &globals.commons,
+        &synthetic,
         target,
         options,
-        imports.stub_count(),
-        unwind_entries,
         &live,
     )?;
     let dynamic = build_dynamic_info(
@@ -191,16 +183,8 @@ fn write_executable(
         &globals,
         options,
     )?;
-    let provisional_common = common_addr_map(&globals, &provisional);
-    let provisional_sym_addr = resolve_all(
-        inputs,
-        &globals,
-        &provisional_common,
-        &provisional.sec_vaddr,
-        &imports,
-        provisional.stubs,
-        &live,
-    )?;
+    let provisional_sym_addr =
+        resolve_addresses(inputs, &globals, &provisional, &imports, &live)?;
     let exports = build_export_trie(
         inputs,
         &globals,
@@ -208,66 +192,37 @@ fn write_executable(
         &provisional_sym_addr,
         options,
     )?;
-    // LINKEDIT opcode payloads begin at pointer alignment. Apart from matching
-    // ld64, this keeps tools such as `dyld_info -fixups` from rejecting a bind
-    // stream whose preceding rebase stream has a non-aligned byte length.
-    let rebase_relative = align_up(streams_relative, 8);
-    let bind_relative = align_up(
-        rebase_relative.saturating_add(
-            u64::try_from(dynamic.rebase.len()).unwrap_or(u64::MAX),
-        ),
-        8,
-    );
-    let export_relative = align_up(
-        bind_relative.saturating_add(
-            u64::try_from(dynamic.bind.len()).unwrap_or(u64::MAX),
-        ),
-        8,
-    );
-    let linkedit_size = export_relative
-        .saturating_add(u64::try_from(exports.len()).unwrap_or(u64::MAX));
+    let offsets = stream_offsets(streams_relative, &dynamic, &exports);
     let layout = layout::build(
         inputs,
-        linkedit_size,
+        offsets.linkedit_size,
         entry,
-        got_plan.count(),
-        &globals.commons,
+        &synthetic,
         target,
         options,
-        imports.stub_count(),
-        unwind_entries,
         &live,
     )?;
-    let common_addr = common_addr_map(&globals, &layout);
-    let sym_addr = resolve_all(
-        inputs,
-        &globals,
-        &common_addr,
-        &layout.sec_vaddr,
-        &imports,
-        layout.stubs,
-        &live,
-    )?;
+    let sym_addr =
+        resolve_addresses(inputs, &globals, &layout, &imports, &live)?;
     let got_addr = build_got_addr(inputs, &got_plan, layout.got);
     let sec_ordinal = section_ordinal_map(&layout)?;
 
     let total = layout.linkedit_fileoff + layout.linkedit_filesize;
     let mut image = vec![0u8; usize::try_from(total).unwrap_or(usize::MAX)];
     write_header(&mut image, target, &layout, options);
+    let symbols = SymbolView {
+        plan: &plan,
+        sym_addr: &sym_addr,
+        sec_ordinal: &sec_ordinal,
+    };
+    let dyld = Dyld::new(&offsets, &dynamic, &exports);
     write_commands(
         &mut image,
         target,
         &layout,
-        &plan,
-        &sym_addr,
-        &sec_ordinal,
+        &symbols,
         options,
-        rebase_relative,
-        u32::try_from(dynamic.rebase.len()).unwrap_or(u32::MAX),
-        bind_relative,
-        u32::try_from(dynamic.bind.len()).unwrap_or(u32::MAX),
-        export_relative,
-        u32::try_from(exports.len()).unwrap_or(u32::MAX),
+        &dyld,
         imports.stub_count(),
     )?;
     write_sections(&mut image, inputs, target, &layout, &sym_addr, &got_addr)?;
@@ -277,22 +232,83 @@ fn write_executable(
     if let Some(got) = layout.got {
         fill_got(&mut image, got, &got_plan, &globals, &sym_addr);
     }
-    write_linkedit(
-        &mut image,
-        &layout,
-        &plan,
-        &sym_addr,
-        &sec_ordinal,
-        &got_plan,
-        &imports,
-        rebase_relative,
-        &dynamic.rebase,
-        bind_relative,
-        &dynamic.bind,
-        export_relative,
-        &exports,
-    );
+    write_linkedit(&mut image, &layout, &symbols, &got_plan, &imports, &dyld);
     Ok(image)
+}
+
+/// Checks the options against the inputs and answers the link target.
+fn link_target(
+    inputs: &[MachOFile<'_>],
+    options: &LinkOptions<'_>,
+) -> Result<MachoTarget> {
+    if options.dylib && (!options.dynamic || options.install_name.is_none()) {
+        return Err(Error::CommandLine(
+            "a Mach-O dylib requires dynamic linking and an install name"
+                .into(),
+        ));
+    }
+    let target = derive_target(inputs)?;
+    if options.arch.is_some_and(|arch| arch != target) {
+        return Err(Error::CommandLine(
+            "-arch disagrees with the Mach-O input objects".into(),
+        ));
+    }
+    Ok(target)
+}
+
+/// Where each `__LINKEDIT` opcode stream begins, measured from the start of
+/// the segment, and how long the segment's content is in total.
+struct StreamOffsets {
+    rebase: u64,
+    bind: u64,
+    export: u64,
+    linkedit_size: u64,
+}
+
+/// Places the opcode streams after the symbol, string and indirect tables.
+///
+/// Payloads begin at pointer alignment. Apart from matching ld64, this keeps
+/// tools such as `dyld_info -fixups` from rejecting a bind stream whose
+/// preceding rebase stream has a non-aligned byte length.
+fn stream_offsets(
+    streams_relative: u64,
+    dynamic: &DynamicInfo,
+    exports: &[u8],
+) -> StreamOffsets {
+    let len = |bytes: &[u8]| u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+    let rebase = align_up(streams_relative, 8);
+    let bind = align_up(rebase.saturating_add(len(&dynamic.rebase)), 8);
+    let export = align_up(bind.saturating_add(len(&dynamic.bind)), 8);
+    StreamOffsets {
+        rebase,
+        bind,
+        export,
+        linkedit_size: export.saturating_add(len(exports)),
+    }
+}
+
+/// Resolves every symbol's address against one layout.
+///
+/// Run twice per link, against the provisional layout and then the final one,
+/// because the dynamic opcode streams are planned from addresses and their
+/// size then moves `__LINKEDIT`.
+fn resolve_addresses(
+    inputs: &[MachOFile<'_>],
+    globals: &Globals<'_>,
+    layout: &MachLayout,
+    imports: &ImportPlan<'_>,
+    live: &LiveSections,
+) -> Result<Vec<Vec<u64>>> {
+    let common = common_addr_map(globals, layout);
+    resolve_all(
+        inputs,
+        globals,
+        &common,
+        &layout.sec_vaddr,
+        imports,
+        layout.stubs,
+        live,
+    )
 }
 
 /// Derives the single link target from the inputs' `cputype`. Every input must
@@ -377,6 +393,85 @@ struct DynamicInfo {
 /// in input data need to move with a PIE slide; an absolute reference to a
 /// TAPI import (notably `__tlv_bootstrap` in `__thread_vars`) binds at its
 /// final section location rather than through the synthetic GOT.
+/// The dyld opcode streams as they are built up.
+#[derive(Default)]
+struct Fixups {
+    /// The bind opcode stream.
+    bind: Vec<u8>,
+    /// Every `(segment ordinal, offset)` that slides with the image.
+    rebases: Vec<(u8, u64)>,
+    /// The rebase sites already recorded, so a site reached twice is emitted
+    /// once.
+    seen: FxHashSet<(u8, u64)>,
+}
+
+impl Fixups {
+    /// Records a rebase site, ignoring one already seen.
+    fn rebase(&mut self, segment: u8, offset: u64) {
+        if self.seen.insert((segment, offset)) {
+            self.rebases.push((segment, offset));
+        }
+    }
+}
+
+/// Records what the synthetic `__got` needs: a slot holding an imported
+/// address binds, and one holding a defined address is an absolute pointer
+/// that slides with the image.
+fn got_fixups(
+    fixups: &mut Fixups,
+    inputs: &[MachOFile<'_>],
+    layout: &MachLayout,
+    got: &GotPlan<'_>,
+    imports: &ImportPlan<'_>,
+    globals: &Globals<'_>,
+    data_segment: u8,
+) -> Result<()> {
+    let Some(got_layout) = layout.got else {
+        return Ok(());
+    };
+    let data = layout
+        .data
+        .as_ref()
+        .ok_or(Error::Format("Mach-O GOT has no data segment"))?;
+    for (slot, key) in got.iter() {
+        let offset = got_layout
+            .addr
+            .wrapping_sub(data.vmaddr)
+            .wrapping_add(u64::from(slot) * 8);
+        let needs_rebase = match key {
+            GotKey::Global(name) => {
+                if let Some(import) = imports.get(name) {
+                    append_bind(
+                        &mut fixups.bind,
+                        import.dylib,
+                        name,
+                        data_segment,
+                        offset,
+                    );
+                    continue;
+                }
+                globals.get(name).is_some_and(|def| {
+                    def.common
+                        || inputs
+                            .get(def.file)
+                            .and_then(|input| {
+                                input.symbols().nth(def.sym as usize)
+                            })
+                            .is_some_and(|sym| sym.n_type & N_TYPE == N_SECT)
+                })
+            }
+            GotKey::Local { file, sym } => inputs
+                .get(file)
+                .and_then(|input| input.symbols().nth(sym as usize))
+                .is_some_and(|sym| sym.n_type & N_TYPE == N_SECT),
+        };
+        if needs_rebase {
+            fixups.rebase(data_segment, offset);
+        }
+    }
+    Ok(())
+}
+
 fn build_dynamic_info(
     inputs: &[MachOFile<'_>],
     layout: &MachLayout,
@@ -385,57 +480,20 @@ fn build_dynamic_info(
     globals: &Globals<'_>,
     options: &LinkOptions<'_>,
 ) -> Result<DynamicInfo> {
-    let mut bind = Vec::new();
-    let mut rebases = Vec::new();
-    let mut seen_rebase = FxHashSet::default();
+    let mut fixups = Fixups::default();
     // Segment ordinals include __PAGEZERO in an executable. A dylib omits
     // that segment, so __TEXT/__DATA shift down by one in every dyld opcode.
     let text_segment = u8::from(!options.dylib);
     let data_segment = text_segment + 1;
-    if let Some(got_layout) = layout.got {
-        let data = layout
-            .data
-            .as_ref()
-            .ok_or(Error::Format("Mach-O GOT has no data segment"))?;
-        for (slot, key) in got.iter() {
-            let offset = got_layout
-                .addr
-                .wrapping_sub(data.vmaddr)
-                .wrapping_add(u64::from(slot) * 8);
-            let needs_rebase = match key {
-                GotKey::Global(name) => {
-                    if let Some(import) = imports.get(name) {
-                        append_bind(
-                            &mut bind,
-                            import.dylib,
-                            name,
-                            data_segment,
-                            offset,
-                        );
-                        continue;
-                    }
-                    globals.get(name).is_some_and(|def| {
-                        def.common
-                            || inputs
-                                .get(def.file)
-                                .and_then(|input| {
-                                    input.symbols().nth(def.sym as usize)
-                                })
-                                .is_some_and(|sym| {
-                                    sym.n_type & N_TYPE == N_SECT
-                                })
-                    })
-                }
-                GotKey::Local { file, sym } => inputs
-                    .get(file)
-                    .and_then(|input| input.symbols().nth(sym as usize))
-                    .is_some_and(|sym| sym.n_type & N_TYPE == N_SECT),
-            };
-            if needs_rebase && seen_rebase.insert((data_segment, offset)) {
-                rebases.push((data_segment, offset));
-            }
-        }
-    }
+    got_fixups(
+        &mut fixups,
+        inputs,
+        layout,
+        got,
+        imports,
+        globals,
+        data_segment,
+    )?;
 
     let mut seen_bind = FxHashSet::default();
     for (segment_index, segment) in [
@@ -479,7 +537,7 @@ fn build_dynamic_info(
                         if let Some(import) = imports.get(sym.name) {
                             if seen_bind.insert((segment_index, offset)) {
                                 append_bind(
-                                    &mut bind,
+                                    &mut fixups.bind,
                                     import.dylib,
                                     sym.name,
                                     segment_index,
@@ -503,19 +561,17 @@ fn build_dynamic_info(
                             continue;
                         }
                     }
-                    if seen_rebase.insert((segment_index, offset)) {
-                        rebases.push((segment_index, offset));
-                    }
+                    fixups.rebase(segment_index, offset);
                 }
             }
         }
     }
-    if !bind.is_empty() {
-        bind.push(0);
+    if !fixups.bind.is_empty() {
+        fixups.bind.push(0);
     }
     Ok(DynamicInfo {
-        rebase: encode_rebases(&rebases),
-        bind,
+        rebase: encode_rebases(&fixups.rebases),
+        bind: fixups.bind,
     })
 }
 
@@ -1178,21 +1234,68 @@ fn command_count(layout: &MachLayout, options: &LinkOptions<'_>) -> u32 {
         + u32::try_from(options.dylibs.len()).unwrap_or(u32::MAX)
 }
 
+/// The resolved symbol table and the two maps a written `nlist_64` needs.
+struct SymbolView<'a> {
+    plan: &'a SymtabPlan<'a>,
+    sym_addr: &'a [Vec<u64>],
+    sec_ordinal: &'a [(usize, u32, u8)],
+}
+
+/// The dyld metadata streams and where each one begins inside `__LINKEDIT`.
+///
+/// The offsets are relative to the start of `__LINKEDIT`. The load commands
+/// and the payload writer both work from this one description, which is what
+/// keeps what the header promises and what is written from parting.
+struct Dyld<'a> {
+    rebase_relative: u64,
+    rebase: &'a [u8],
+    bind_relative: u64,
+    bind: &'a [u8],
+    export_relative: u64,
+    exports: &'a [u8],
+}
+
+impl<'a> Dyld<'a> {
+    /// Pairs the planned stream offsets with the bytes they describe.
+    fn new(
+        offsets: &StreamOffsets,
+        dynamic: &'a DynamicInfo,
+        exports: &'a [u8],
+    ) -> Self {
+        Self {
+            rebase_relative: offsets.rebase,
+            rebase: &dynamic.rebase,
+            bind_relative: offsets.bind,
+            bind: &dynamic.bind,
+            export_relative: offsets.export,
+            exports,
+        }
+    }
+
+    /// The rebase stream's byte length, as the load command spells it.
+    fn rebase_size(&self) -> u32 {
+        u32::try_from(self.rebase.len()).unwrap_or(u32::MAX)
+    }
+
+    /// The bind stream's byte length.
+    fn bind_size(&self) -> u32 {
+        u32::try_from(self.bind.len()).unwrap_or(u32::MAX)
+    }
+
+    /// The export trie's byte length.
+    fn export_size(&self) -> u32 {
+        u32::try_from(self.exports.len()).unwrap_or(u32::MAX)
+    }
+}
+
 /// Writes the load-command table right after the header.
 fn write_commands(
     image: &mut [u8],
     target: MachoTarget,
     layout: &MachLayout,
-    plan: &SymtabPlan,
-    sym_addr: &[Vec<u64>],
-    sec_ordinal: &[(usize, u32, u8)],
+    symbols: &SymbolView<'_>,
     options: &LinkOptions<'_>,
-    rebase_relative: u64,
-    rebase_size: u32,
-    bind_relative: u64,
-    bind_size: u32,
-    export_relative: u64,
-    export_size: u32,
+    dyld: &Dyld<'_>,
     stub_count: u32,
 ) -> Result<()> {
     let mut off = HEADER_SIZE;
@@ -1204,27 +1307,17 @@ fn write_commands(
         off = write_segment(image, off, data)?;
     }
     off = write_linkedit_segment(image, off, layout);
-    off = write_symtab(image, off, layout, plan);
+    off = write_symtab(image, off, layout, symbols.plan);
     let got_count = layout.got.map_or(0, |g| g.count);
     off = write_dysymtab(
         image,
         off,
-        plan,
+        symbols.plan,
         layout,
         got_count.saturating_add(stub_count),
     )?;
     if options.dynamic {
-        off = write_dyld_info(
-            image,
-            off,
-            layout,
-            rebase_relative,
-            rebase_size,
-            bind_relative,
-            bind_size,
-            export_relative,
-            export_size,
-        );
+        off = write_dyld_info(image, off, layout, dyld);
     }
     if let Some(platform) = options.platform {
         off = write_build_version(image, off, platform);
@@ -1240,7 +1333,14 @@ fn write_commands(
     } else {
         off = write_thread(image, off, target, layout);
     }
-    write_uuid(image, off, target, layout, sym_addr, sec_ordinal);
+    write_uuid(
+        image,
+        off,
+        target,
+        layout,
+        symbols.sym_addr,
+        symbols.sec_ordinal,
+    );
     Ok(())
 }
 
@@ -1270,16 +1370,14 @@ fn write_dyld_info(
     image: &mut [u8],
     off: u64,
     layout: &MachLayout,
-    rebase_relative: u64,
-    rebase_size: u32,
-    bind_relative: u64,
-    bind_size: u32,
-    export_relative: u64,
-    export_size: u32,
+    dyld: &Dyld<'_>,
 ) -> u64 {
-    let rebase_off = layout.linkedit_fileoff.saturating_add(rebase_relative);
-    let bind_off = layout.linkedit_fileoff.saturating_add(bind_relative);
-    let export_off = layout.linkedit_fileoff.saturating_add(export_relative);
+    let base = layout.linkedit_fileoff;
+    let rebase_off = base.saturating_add(dyld.rebase_relative);
+    let bind_off = base.saturating_add(dyld.bind_relative);
+    let export_off = base.saturating_add(dyld.export_relative);
+    let (rebase_size, bind_size, export_size) =
+        (dyld.rebase_size(), dyld.bind_size(), dyld.export_size());
     write_pod(
         image,
         off,
@@ -1665,18 +1763,16 @@ fn mix_to_uuid(hash: u64) -> [u8; 16] {
 fn write_linkedit(
     image: &mut [u8],
     layout: &MachLayout,
-    plan: &SymtabPlan<'_>,
-    sym_addr: &[Vec<u64>],
-    sec_ordinal: &[(usize, u32, u8)],
+    symbols: &SymbolView<'_>,
     got_plan: &GotPlan<'_>,
     imports: &ImportPlan<'_>,
-    rebase_relative: u64,
-    rebase: &[u8],
-    bind_relative: u64,
-    bind: &[u8],
-    export_relative: u64,
-    exports: &[u8],
+    dyld: &Dyld<'_>,
 ) {
+    let (plan, sym_addr, sec_ordinal) =
+        (symbols.plan, symbols.sym_addr, symbols.sec_ordinal);
+    let (rebase_relative, rebase) = (dyld.rebase_relative, dyld.rebase);
+    let (bind_relative, bind) = (dyld.bind_relative, dyld.bind);
+    let (export_relative, exports) = (dyld.export_relative, dyld.exports);
     let common_sect = common_section_ordinal(layout);
     let mut off = layout.linkedit_fileoff;
     for class in [SymClass::Local, SymClass::Extdef, SymClass::Undef] {

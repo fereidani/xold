@@ -293,18 +293,28 @@ impl<'data> ObjectFile<'data> {
     /// The `SHT_RELA` entries that apply to `target_shndx`, if any.
     ///
     /// Fails for a section an `SHT_REL` section applies to; see [`Relocs`].
+    /// Fails too when more than one relocation section claims the target;
+    /// see [`Self::reloc_index`].
     pub fn relocations(
         &self,
         target_shndx: u16,
     ) -> Result<Option<&'data [Rela64]>> {
+        let mut found = None;
         for shdr in self.sections {
             let applies =
                 shdr.sh_type.get() == SHT_RELA || shdr.sh_type.get() == SHT_REL;
-            if applies && shdr.sh_info.get() == u32::from(target_shndx) {
-                return relocs_of(self.bytes, shdr)?.entries();
+            if !applies || shdr.sh_info.get() != u32::from(target_shndx) {
+                continue;
             }
+            if found.is_some() && target_shndx != 0 {
+                return Err(MULTIPLE_RELOC_SECTIONS);
+            }
+            found.get_or_insert(shdr);
         }
-        Ok(None)
+        match found {
+            Some(shdr) => relocs_of(self.bytes, shdr)?.entries(),
+            None => Ok(None),
+        }
     }
 
     /// Precomputes a dense `target section index -> relocations` table so the
@@ -328,7 +338,18 @@ impl<'data> ObjectFile<'data> {
             let Ok(target) = usize::try_from(shdr.sh_info.get()) else {
                 continue;
             };
-            if target < len && matches!(out[target], Relocs::None) {
+            if target >= len {
+                continue;
+            }
+            // Keeping only the first table and dropping the rest leaves the
+            // entries in the others unapplied, which links successfully and
+            // silently omits a call or a data reference. Section 0 is exempt:
+            // it is never a real target, and it is where a shared object's
+            // `.rela.dyn` and `.rela.plt` both point.
+            if target != 0 && !matches!(out[target], Relocs::None) {
+                return Err(MULTIPLE_RELOC_SECTIONS);
+            }
+            if matches!(out[target], Relocs::None) {
                 out[target] = relocs_of(self.bytes, shdr)?;
             }
         }
@@ -695,6 +716,15 @@ fn end_of(offset: usize, size: usize, what: &'static str) -> Result<usize> {
 /// Classifies one relocation section, viewing its entries when xold can read
 /// them. See [`Relocs`] for why an `SHT_REL` section is recorded rather than
 /// refused here.
+/// Reported when two relocation sections name the same target section.
+///
+/// The ELF spec permits it, no mainstream producer emits it, and applying
+/// only one of the tables would leave real relocations unapplied. lld refuses
+/// it in the same words (`lld/ELF/InputFiles.cpp`).
+const MULTIPLE_RELOC_SECTIONS: Error = Error::Format(
+    "multiple relocation sections to one section are not supported",
+);
+
 fn relocs_of<'a>(bytes: &'a [u8], shdr: &Shdr64) -> Result<Relocs<'a>> {
     match shdr.sh_type.get() {
         SHT_RELA => Ok(Relocs::Rela(view_slice(

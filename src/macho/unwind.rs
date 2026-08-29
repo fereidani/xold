@@ -289,8 +289,12 @@ fn compact_entries(
             {
                 continue;
             }
-            for (index, raw) in
-                section.data.chunks_exact(COMPACT_ENTRY_SIZE).enumerate()
+            for (index, raw) in section
+                .data
+                .as_chunks::<COMPACT_ENTRY_SIZE>()
+                .0
+                .iter()
+                .enumerate()
             {
                 let record = index.saturating_mul(COMPACT_ENTRY_SIZE);
                 let address = u32::try_from(record).map_err(|_| {

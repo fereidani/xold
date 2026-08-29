@@ -145,27 +145,7 @@ pub fn write(
             "Mach-O unwind inputs produced an empty __unwind_info index",
         ));
     }
-    let mut personalities: Vec<u32> = entries
-        .iter()
-        .filter_map(|entry| entry.personality)
-        .collect();
-    personalities.sort_unstable();
-    personalities.dedup();
-    if personalities.len() > 3 {
-        return Err(Error::OutOfRange("Mach-O unwind personalities"));
-    }
-    for entry in &mut entries {
-        if let Some(personality) = entry.personality {
-            let index = personalities
-                .iter()
-                .position(|candidate| *candidate == personality)
-                .ok_or(Error::Format("missing Mach-O unwind personality"))?;
-            entry.encoding |= u32::try_from(index + 1).unwrap_or(3) << 28;
-        }
-        if entry.lsda.is_some() {
-            entry.encoding |= 0x4000_0000;
-        }
-    }
+    let personalities = apply_personalities(&mut entries)?;
     let lsdas: Vec<_> = entries
         .iter()
         .filter_map(|entry| entry.lsda.map(|lsda| (entry.function, lsda)))
@@ -220,17 +200,77 @@ pub fn write(
         put_u32(out, at + 4, *lsda)?;
     }
 
-    let first = entries[0].function;
+    write_pages(
+        out,
+        &entries,
+        &lsdas,
+        &Offsets {
+            index: index_offset,
+            lsda: lsda_offset,
+            pages: pages_offset,
+            page_count,
+        },
+    )
+}
+
+/// Where the three variable-length parts of `__unwind_info` begin, measured
+/// from the start of the section.
+struct Offsets {
+    index: u32,
+    lsda: u32,
+    pages: u32,
+    page_count: usize,
+}
+
+/// Assigns each entry its personality index and LSDA bit, and answers the
+/// personality table the header describes.
+///
+/// The format has room for three, which is the encoding's two-bit index with
+/// zero meaning "none", so a fourth is refused rather than truncated.
+fn apply_personalities(entries: &mut [Entry]) -> Result<Vec<u32>> {
+    let mut personalities: Vec<u32> = entries
+        .iter()
+        .filter_map(|entry| entry.personality)
+        .collect();
+    personalities.sort_unstable();
+    personalities.dedup();
+    if personalities.len() > 3 {
+        return Err(Error::OutOfRange("Mach-O unwind personalities"));
+    }
+    for entry in entries {
+        if let Some(personality) = entry.personality {
+            let index = personalities
+                .iter()
+                .position(|candidate| *candidate == personality)
+                .ok_or(Error::Format("missing Mach-O unwind personality"))?;
+            entry.encoding |= u32::try_from(index + 1).unwrap_or(3) << 28;
+        }
+        if entry.lsda.is_some() {
+            entry.encoding |= 0x4000_0000;
+        }
+    }
+    Ok(personalities)
+}
+
+/// Writes the first-level index and the regular second-level pages, closing
+/// with the sentinel row that gives the last function's end address.
+fn write_pages(
+    out: &mut [u8],
+    entries: &[Entry],
+    lsdas: &[(u32, u32)],
+    at: &Offsets,
+) -> Result<()> {
+    let first = entries.first().map_or(0, |row| row.function);
     let sentinel = entries.iter().fold(first.saturating_add(1), |end, row| {
         end.max(row.function.saturating_add(row.length.max(1)))
     });
-    let mut page_at = usize::try_from(pages_offset)
+    let mut page_at = usize::try_from(at.pages)
         .map_err(|_| Error::OutOfRange("Mach-O unwind page offset"))?;
     for (page, chunk) in entries.chunks(ENTRIES_PER_PAGE).enumerate() {
-        let index_at = usize::try_from(index_offset)
+        let index_at = usize::try_from(at.index)
             .unwrap_or(usize::MAX)
             .saturating_add(page.saturating_mul(12));
-        let page_lsda = lsda_offset.saturating_add(
+        let page_lsda = at.lsda.saturating_add(
             u32::try_from(
                 lsdas
                     .iter()
@@ -257,21 +297,20 @@ pub fn write(
                 .map_err(|_| Error::OutOfRange("Mach-O unwind page entries"))?,
         )?;
         for (i, row) in chunk.iter().enumerate() {
-            let at = page_at
+            let slot = page_at
                 .saturating_add(8)
                 .saturating_add(i.saturating_mul(8));
-            put_u32(out, at, row.function)?;
-            put_u32(out, at + 4, row.encoding)?;
+            put_u32(out, slot, row.function)?;
+            put_u32(out, slot + 4, row.encoding)?;
         }
         page_at = page_at
             .saturating_add(8)
             .saturating_add(chunk.len().saturating_mul(8));
     }
-    let sentinel_at = usize::try_from(index_offset)
+    let sentinel_at = usize::try_from(at.index)
         .unwrap_or(usize::MAX)
-        .saturating_add(page_count.saturating_mul(12));
-    put_index(out, sentinel_at, sentinel, 0, pages_offset)?;
-    Ok(())
+        .saturating_add(at.page_count.saturating_mul(12));
+    put_index(out, sentinel_at, sentinel, 0, at.pages)
 }
 
 fn compact_entries(

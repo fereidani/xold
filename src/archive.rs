@@ -153,6 +153,14 @@ impl<'data> Archive<'data> {
         self.index.get(name).copied()
     }
 
+    /// How many symbols the index holds.
+    ///
+    /// Every member a lookup can reach is named by at least one of them, so
+    /// this bounds the number of members a lookup-driven sweep can extract.
+    pub fn indexed_symbols(&self) -> usize {
+        self.index.len()
+    }
+
     /// The library's position among the direct inputs (see [`Self::pos`]).
     pub const fn pos(&self) -> u32 {
         self.pos

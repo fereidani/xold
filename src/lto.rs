@@ -40,6 +40,7 @@ pub use resolve::{Facts, Winner, resolution};
 use rustc_hash::FxHashSet;
 
 use crate::{
+    archive::Archive,
     error::{Error, Result},
     input::Format,
     lto::link as lto_link,
@@ -82,7 +83,7 @@ pub fn compile(job: &Job<'_>) -> Result<Compiled> {
     let mut archives: Vec<(PathBuf, Vec<u8>)> = Vec::new();
     for input in job.inputs {
         let bytes = std::fs::read(input).map_err(Error::Io)?;
-        if crate::archive::Archive::is_archive(&bytes) {
+        if Archive::is_archive(&bytes) {
             archives.push((input.clone(), bytes));
             continue;
         }
@@ -225,13 +226,22 @@ fn claim_archive_members(
     }
     let mut parsed = Vec::with_capacity(archives.len());
     for (path, bytes) in archives {
-        parsed.push(crate::archive::Archive::parse(bytes, path)?);
+        parsed.push(Archive::parse(bytes, path)?);
     }
     let mut taken: FxHashSet<(usize, u64)> = FxHashSet::default();
     let mut claimed = 0usize;
-    // A round claims at least one member or the sweep is done, so the member
-    // count bounds it; the constant is the ceiling on that.
-    for round in 0..MAX_ARCHIVE_ROUNDS {
+    // A round claims at least one member or the sweep is done, and every
+    // member a lookup can reach is named by an index entry, so the total
+    // number of indexed symbols bounds the walk. Taking the bound from the
+    // archives rather than from a constant is what lets a long dependency
+    // chain finish: a fixed ceiling stopped part way through one and left the
+    // rest unclaimed, with no diagnostic to say so.
+    let rounds = parsed
+        .iter()
+        .map(Archive::indexed_symbols)
+        .sum::<usize>()
+        .saturating_add(1);
+    for round in 0..rounds {
         let mut wanted = regular.undefined()?;
         if round > 0 {
             wanted.extend(
@@ -272,13 +282,6 @@ fn claim_archive_members(
     }
     Ok(claimed)
 }
-
-/// How many extraction rounds the archive sweep runs before giving up.
-///
-/// Each round that does anything claims a member, and an archive has finitely
-/// many; the bound is here so a lookup that kept reporting the same member
-/// could not spin.
-const MAX_ARCHIVE_ROUNDS: usize = 64;
 
 /// Claims every bitcode member of a `--start-lib` group.
 ///

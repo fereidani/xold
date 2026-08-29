@@ -393,7 +393,7 @@ int bump(void) { hidden += 1; return hidden; }
 
 /// The lowered executable has no dynamic TLS helper or unresolved fixups and
 /// retains a real TLS template. This is the loader-independent contract behind
-/// the runtime checks on a host that cannot execute x86_64 ELF.
+/// the runtime checks on a host that cannot execute `x86_64` ELF.
 fn assert_lowered_tls_image(path: &Path) {
     let bytes = fs::read(path).expect("read linked image");
     let obj = ObjectFile::parse(&bytes).expect("valid ELF");

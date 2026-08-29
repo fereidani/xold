@@ -186,10 +186,11 @@ fn assert_bound_run(bytes: &[u8]) {
             .syms
             .iter()
             .find(|sym| symtab.name(sym) == name)
-            .map(|sym| sym.st_value.get())
             .unwrap_or_else(|| {
                 panic!("{} is defined", String::from_utf8_lossy(name))
             })
+            .st_value
+            .get()
     };
     let start = value(b"__start_regtab");
     let stop = value(b"__stop_regtab");

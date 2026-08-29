@@ -153,7 +153,7 @@ fn a_relocated_merge_entry_keeps_its_value() {
 }
 
 /// Reproduces all four runtime return conditions directly from the linked
-/// image when the host cannot execute x86_64 ELF.
+/// image when the host cannot execute `x86_64` ELF.
 fn assert_relocated_entries(bytes: &[u8]) {
     let obj = ObjectFile::parse(bytes).expect("valid ELF");
     let symtab = obj.symbol_table().expect("read symtab").expect("symtab");
@@ -162,10 +162,11 @@ fn assert_relocated_entries(bytes: &[u8]) {
             .syms
             .iter()
             .find(|sym| symtab.name(sym) == name)
-            .map(|sym| sym.st_value.get())
             .unwrap_or_else(|| {
                 panic!("{} is defined", String::from_utf8_lossy(name))
             })
+            .st_value
+            .get()
     };
     let plain = addr(b"plain_entry");
     let pointer = addr(b"ptr_entry");

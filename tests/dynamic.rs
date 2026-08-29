@@ -533,7 +533,7 @@ fn assert_export_loader_contract(so: &Path) {
 }
 
 /// Pins the exact pointer values the ELF loader would materialise: `gp` is
-/// the R_X86_64_64 site naming `counter`, whose initial value is five, and
+/// the `R_X86_64_64` site naming `counter`, whose initial value is five, and
 /// the relative relocation's addend names the private integer initialised to
 /// seven.
 fn assert_data_pointer_loader_contract(

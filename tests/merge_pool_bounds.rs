@@ -194,10 +194,11 @@ fn assert_pool_contract(bytes: &[u8]) {
             .syms
             .iter()
             .find(|sym| symtab.name(sym) == name)
-            .map(|sym| sym.st_value.get())
             .unwrap_or_else(|| {
                 panic!("{} is defined", String::from_utf8_lossy(name))
-            });
+            })
+            .st_value
+            .get();
         let body = image_at(&obj, addr, 6).expect("accessor body");
         assert_eq!(body[0], 0xb8, "accessor returns an immediate pointer");
         u64::from(u32::from_le_bytes(body[1..5].try_into().unwrap()))

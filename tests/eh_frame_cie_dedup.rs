@@ -206,7 +206,7 @@ fn link_fixture(tag: &str) -> Option<PathBuf> {
     Some(prog)
 }
 
-/// Non-ELF hosts cannot execute the x86_64 image, so verify the exact unwind
+/// Non-ELF hosts cannot execute the `x86_64` image, so verify the exact unwind
 /// contract the runtime consumes: every FDE reaches a retained CIE and the
 /// language-specific handler table survived the link.
 fn assert_exception_metadata_survives(prog: &Path) {

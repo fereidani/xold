@@ -33,7 +33,7 @@ pub fn which(cmd: &str) -> Option<PathBuf> {
     None
 }
 
-/// Resolves an archive tool that can index the x86_64 ELF fixtures.
+/// Resolves an archive tool that can index the `x86_64` ELF fixtures.
 ///
 /// Apple's `/usr/bin/ar` accepts an ELF member but leaves it without a symbol
 /// index, so lazy archive extraction cannot exercise the behavior under test.
@@ -49,12 +49,14 @@ pub fn archive_tool() -> Option<PathBuf> {
     }
 }
 
-/// Returns a compiled x86_64 ELF object for a tracked source fixture.
+/// Returns a compiled `x86_64` ELF object for a tracked source fixture.
 ///
 /// Object files are intentionally not tracked. Build each one once per test
 /// process in a private temp directory so parallel integration tests neither
 /// depend on repository-generated artifacts nor race one another.
 pub fn elf_fixture(name: &str) -> PathBuf {
+    static BUILT: OnceLock<Mutex<HashMap<String, PathBuf>>> = OnceLock::new();
+
     let mut tracked = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     tracked.push("tests/fixtures");
     tracked.push(name);
@@ -68,7 +70,6 @@ pub fn elf_fixture(name: &str) -> PathBuf {
         tracked.display()
     );
 
-    static BUILT: OnceLock<Mutex<HashMap<String, PathBuf>>> = OnceLock::new();
     let mut built = BUILT
         .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
@@ -92,14 +93,22 @@ pub fn elf_fixture(name: &str) -> PathBuf {
     let clang = which("clang").expect("clang builds ELF fixtures");
     let mut command = Command::new(clang);
     command.arg("--target=x86_64-linux-gnu");
+    // PIC is the default because `link.rs` asserts the `min.o` + `ext.o`
+    // output carries a `.got` entry holding `global_counter`'s address, and
+    // only a PIC compile routes that reference through the GOT. It is
+    // harmless for the fixtures that do not depend on it.
     match stem {
-        "min" => {
-            command.arg("-fPIC");
-        }
+        // The freestanding smoke test is linked with its own `_start` and
+        // run directly: no loader, so no GOT to fill.
         "prog" => {
             command.args(["-ffreestanding", "-fno-pie", "-fno-pic"]);
         }
+        // Assembly, where the PIC model does not apply.
         "start" => {}
+        // `shared_obj` must stay a tentative definition for the precedence
+        // tests. gcc 10 and clang 11 default to `-fno-common`, which makes it
+        // an ordinary `.bss` definition and turns
+        // `strong_definition_outranks_common` into a duplicate-symbol error.
         "common_obj" => {
             command.args(["-fPIC", "-fcommon"]);
         }

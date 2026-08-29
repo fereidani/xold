@@ -15,7 +15,7 @@
 //! contradiction, and the fix keeps it one.
 //!
 //! On arm64 macOS the agreement case is linked as a native dynamic Mach-O
-//! image and executed; other hosts retain the original x86_64 ELF fixture.
+//! image and executed; other hosts retain the original `x86_64` ELF fixture.
 //! Gated on `clang`; if it is missing the tests print a note and return.
 
 use std::{
@@ -24,7 +24,11 @@ use std::{
     process::Command,
 };
 
-use common::{which, xold_bin};
+use common::which;
+// Only the arm64 Mach-O path drives the built binary; elsewhere the check
+// links in-process through `link_to`.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+use common::xold_bin;
 use xold::{icf::IcfMode, linker::link_to};
 
 mod common;

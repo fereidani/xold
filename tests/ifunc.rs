@@ -401,9 +401,9 @@ fn a_caller_binds_to_a_shared_object_s_indirect_function() {
 }
 
 /// Builds the same ELF caller with xold when the host toolchain cannot link or
-/// execute ELF, then verifies both external calls bind through JUMP_SLOT rows
-/// to the shared object's plain-function exports. The library's own call keeps
-/// its IRELATIVE-backed stub.
+/// execute ELF, then verifies both external calls bind through `JUMP_SLOT`
+/// rows to the shared object's plain-function exports. The library's own call
+/// keeps its IRELATIVE-backed stub.
 fn assert_foreign_caller_contract(dir: &Path, lib: &Path, caller_src: &str) {
     let caller_o = dir.join("caller.o");
     let start_o = dir.join("start.o");

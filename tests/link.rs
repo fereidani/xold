@@ -71,10 +71,11 @@ fn assert_freestanding_contract(path: &Path) {
         symtab
             .iter()
             .find(|sym| symtab.name(sym) == name)
-            .map(|sym| sym.st_value.get())
             .unwrap_or_else(|| {
                 panic!("{} is defined", String::from_utf8_lossy(name))
             })
+            .st_value
+            .get()
     };
     let counter = value(b"counter");
     let entry = value(b"entry");

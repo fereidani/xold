@@ -158,14 +158,12 @@ fn phdr_types(bytes: &[u8]) -> Vec<u32> {
         .get(54..56)
         .and_then(|cell| cell.try_into().ok())
         .map(u16::from_le_bytes)
-        .map(usize::from)
-        .unwrap_or(0);
+        .map_or(0, usize::from);
     let count = bytes
         .get(56..58)
         .and_then(|cell| cell.try_into().ok())
         .map(u16::from_le_bytes)
-        .map(usize::from)
-        .unwrap_or(0);
+        .map_or(0, usize::from);
     (0..count)
         .filter_map(|i| {
             let at = phoff.checked_add(i.checked_mul(entsize)?)?;

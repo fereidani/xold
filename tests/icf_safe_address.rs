@@ -285,7 +285,7 @@ fn symbol_value(bytes: &[u8], name: &[u8]) -> Option<u64> {
 }
 
 /// Structural equivalent of the exit-bit checks on a host that cannot run
-/// x86_64 ELF: the address-taken pair remains distinct, `pick`'s two LEAs
+/// `x86_64` ELF: the address-taken pair remains distinct, `pick`'s two LEAs
 /// resolve to exactly those addresses, and both arithmetic bodies retain the
 /// constants the runtime checks.
 fn assert_program_contract(bytes: &[u8]) {

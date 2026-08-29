@@ -105,19 +105,20 @@ fn assert_plain_reference_contract(bytes: &[u8]) {
             .syms
             .iter()
             .find(|sym| symtab.name(sym) == name)
-            .map(|sym| sym.st_value.get())
             .unwrap_or_else(|| {
                 panic!("{} is defined", String::from_utf8_lossy(name))
             })
+            .st_value
+            .get()
     };
-    let foo = value(b"foo");
+    let alias = value(b"foo");
     assert_eq!(
-        foo,
+        alias,
         value(b"foo_impl"),
         "the versioned alias names its implementation"
     );
     assert_eq!(
-        image_at(&obj, foo, 6),
+        image_at(&obj, alias, 6),
         Some(b"\xb8\x2a\0\0\0\xc3".as_slice()),
         "the definition returns 42"
     );
@@ -129,7 +130,7 @@ fn assert_plain_reference_contract(bytes: &[u8]) {
         start
             .wrapping_add(5)
             .wrapping_add(i64::from(disp).cast_unsigned()),
-        foo,
+        alias,
         "the plain call resolves to foo@@VERS_1"
     );
 }

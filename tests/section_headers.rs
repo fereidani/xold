@@ -45,7 +45,7 @@ fn workdir(prefix: &str) -> PathBuf {
     dir
 }
 
-/// Compiles `src` for the explicit target in `extra`, or x86_64 ELF by
+/// Compiles `src` for the explicit target in `extra`, or `x86_64` ELF by
 /// default, returning the object.
 fn compile(
     dir: &Path,

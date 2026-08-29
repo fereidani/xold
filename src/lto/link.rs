@@ -25,6 +25,7 @@ use crate::{
     lto::{
         api::{
             LDPK_COMMON, LDPK_DEF, LDPK_WEAKDEF, LDPK_WEAKUNDEF, LDPV_DEFAULT,
+            LDPV_PROTECTED,
         },
         resolve::{Facts, Winner, resolution},
         session,
@@ -272,7 +273,14 @@ pub fn resolve_claimed(regular: &Regular, export_all: bool) -> Result<()> {
                 prevailing: defined && !outranked && owner == Some(file.handle),
                 winner: where_,
                 used_in_regular_obj: seen.used,
-                exported: export_all && sym.visibility == LDPV_DEFAULT,
+                // Protected is exported just as default is: it cannot be
+                // interposed, but it is still in `.dynsym` and still
+                // reachable from outside. lld gates this on the binding not
+                // being local rather than on default visibility
+                // (`lld/ELF/LTO.cpp`), and calling a protected definition
+                // invisible lets LTO treat a real dynamic export as internal.
+                exported: export_all
+                    && matches!(sym.visibility, LDPV_DEFAULT | LDPV_PROTECTED),
             };
             sym.resolution = resolution(&facts).cast_signed();
         }

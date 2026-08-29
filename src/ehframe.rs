@@ -284,7 +284,7 @@ pub fn build_hdr(image: &[u8], layout: &Layout) -> Result<Vec<u8>> {
     // (`lld/ELF/SyntheticSections.cpp`).
     entries.dedup_by_key(|e| e.pc);
 
-    Ok(serialize_hdr(&entries, eh.vaddr, hdr.vaddr))
+    serialize_hdr(&entries, eh.vaddr, hdr.vaddr)
 }
 
 /// Fills `out` with every placed code region and returns how many it wrote.
@@ -608,7 +608,11 @@ fn sign_extend(v: u64, bits: u32) -> u64 {
 /// `.eh_frame` pointer, the FDE count, and the `(pc, fde_offset)` table sorted
 /// by PC. All table values are encoded `DW_EH_PE_datarel | DW_EH_PE_sdata4`,
 /// i.e. signed 32-bit offsets from the `.eh_frame_hdr` load address.
-fn serialize_hdr(entries: &[Entry], eh_vaddr: u64, hdr_vaddr: u64) -> Vec<u8> {
+fn serialize_hdr(
+    entries: &[Entry],
+    eh_vaddr: u64,
+    hdr_vaddr: u64,
+) -> Result<Vec<u8>> {
     let mut out = Vec::with_capacity(
         usize::try_from(HDR_FIXED).unwrap_or(0) + entries.len() * 8,
     );
@@ -617,14 +621,34 @@ fn serialize_hdr(entries: &[Entry], eh_vaddr: u64, hdr_vaddr: u64) -> Vec<u8> {
     out.push(DW_EH_PE_UDATA4); // fde_count_enc
     out.push(DW_EH_PE_DATAREL | DW_EH_PE_SDATA4); // table_enc
     // `eh_frame_ptr` is PC-relative to this 4-byte field (header offset 4).
-    push_rel32(&mut out, eh_vaddr.wrapping_sub(hdr_vaddr + 4));
+    push_rel32(
+        &mut out,
+        checked_rel32(eh_vaddr, hdr_vaddr.wrapping_add(4))?,
+    );
     push_u32(&mut out, u32::try_from(entries.len()).unwrap_or(0));
     for e in entries {
         // datarel to the .eh_frame_hdr start.
-        push_rel32(&mut out, e.pc.wrapping_sub(hdr_vaddr));
-        push_rel32(&mut out, e.fde_addr.wrapping_sub(hdr_vaddr));
+        push_rel32(&mut out, checked_rel32(e.pc, hdr_vaddr)?);
+        push_rel32(&mut out, checked_rel32(e.fde_addr, hdr_vaddr)?);
     }
-    out
+    Ok(out)
+}
+
+/// `value - base` as a displacement that fits the `DW_EH_PE_sdata4` slots
+/// every `.eh_frame_hdr` field is encoded in.
+///
+/// The table declares itself `sdata4`, so a wider difference has no encoding:
+/// storing the low half sign-extends into a plausible nearby address and
+/// points the unwinder's binary search at the wrong FDE, which surfaces much
+/// later as an exception that fails to find its handler. lld refuses the same
+/// case ("PC offset is too large", `lld/ELF/SyntheticSections.cpp`), so an
+/// image too large to describe is reported rather than silently mis-encoded.
+fn checked_rel32(value: u64, base: u64) -> Result<u64> {
+    let rel = value.wrapping_sub(base);
+    if i32::try_from(rel.cast_signed()).is_err() {
+        return Err(Error::OutOfRange(".eh_frame_hdr table offset"));
+    }
+    Ok(rel)
 }
 
 fn read_u32(bytes: &[u8], offset: usize) -> Result<u32> {

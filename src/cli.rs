@@ -113,6 +113,10 @@ pub struct Options {
     pub macho_platform: Option<PlatformVersion>,
     /// `-dead_strip`: enable the Mach-O section reachability pass.
     pub macho_dead_strip: bool,
+    /// `-plugin`: the LTO plugin to load, as the driver spelled it.
+    pub lto_plugin: Option<PathBuf>,
+    /// `-plugin-opt=`: options handed to that plugin unchanged.
+    pub lto_plugin_opts: Vec<String>,
 }
 /// What the command line asked for.
 ///
@@ -288,10 +292,19 @@ fn separated(
         "-u" | "--undefined" => {
             p.undefined.push(next(args, at, "-u")?.to_string());
         }
-        // Options carrying an argument a non-LTO input link has no use for:
-        // GNU's plugin controls and ld64's driver plumbing. The argument is
-        // consumed so the walk does not go on to read it as an input file.
-        "-plugin" | "-plugin-opt" | "-lto_library" | "-mllvm" => {
+        // The LTO plugin to load. Honoured exactly as written: the bitcode
+        // a plugin can read is tied to the LLVM it was built from, and a
+        // driver that names one means that one. rustc's
+        // `-Clinker-plugin-lto` depends on the distinction, because rustc
+        // ships an LLVM of its own.
+        "-plugin" => {
+            p.lto_plugin = Some(PathBuf::from(next(args, at, "-plugin")?));
+        }
+        // Options carrying an argument this link has no use for: the
+        // separated spelling of a plugin option, and ld64's driver plumbing.
+        // The argument is consumed so the walk does not go on to read it as
+        // an input file.
+        "-plugin-opt" | "-lto_library" | "-mllvm" => {
             let _ = next(args, at, arg)?;
         }
         "-arch" => {
@@ -376,12 +389,14 @@ fn plain(
         // which is what GNU `ld` does; the printing happened before this
         // walk, in `asked_about_itself`.
         "-v" => println!("{}", version_text().trim()),
-        // `gcc` passes its LTO plugin on every link, whether or not any
-        // input needs one. The plugin exists to read LTO bytecode, and an
-        // input that holds some is refused where it is read, by name -- so
-        // for every other link the option describes work there is none of,
-        // and accepting it produces exactly the image asked for.
-        s if s.starts_with("-plugin-opt=") => {}
+        // `gcc` and `clang` pass their plugin options on every link,
+        // whether or not any input needs one. They are collected rather than
+        // dropped: a link with bitcode in it hands them to the plugin, and a
+        // link without one has nothing to hand them to.
+        s if s.starts_with("-plugin-opt=") => {
+            p.lto_plugin_opts
+                .push(s["-plugin-opt=".len()..].to_string());
+        }
         // A bare `--build-id` leaves the style to the linker. lld answers
         // with its cheap digest and so does this: hashing a large image
         // cryptographically costs more than the rest of the link, and

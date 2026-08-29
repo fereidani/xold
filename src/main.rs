@@ -37,6 +37,7 @@ use xold::{
     icf::IcfMode,
     input::{Format, Input},
     linker::{Link, link_image},
+    lto,
     macho::{Dylib, LinkOptions as MachOLinkOptions, link_macho_with_options},
     script::{self, Search},
     startlib,
@@ -122,6 +123,9 @@ fn run(opts: &Options) -> Result<()> {
     list.collect(opts)?;
     let inputs = list.scan;
     check_command_line(opts, inputs)?;
+    if inputs.bitcode {
+        return link_bitcode(opts, &list);
+    }
     let files = list.views();
     // Mach-O inputs take a separate link path; the ELF linker cannot consume
     // them.
@@ -138,8 +142,12 @@ fn run(opts: &Options) -> Result<()> {
         let entry = default_entry(opts, b"main");
         return link_coff(&files, &opts.output, entry, opts.shared);
     }
+    link_elf(opts, &files, inputs.shared)
+}
+
+/// The ELF link itself, over an input list that is already settled.
+fn link_elf(opts: &Options, files: &[Input<'_>], shared: bool) -> Result<()> {
     refuse_macho_output_options(opts, "ELF")?;
-    let shared = inputs.shared;
     // The version script is read here rather than during parsing: a link that
     // never reaches the ELF path has no use for it, and a read that fails
     // should report as a link error naming the file.
@@ -147,7 +155,7 @@ fn run(opts: &Options) -> Result<()> {
     let undefined: Vec<&[u8]> =
         opts.undefined.iter().map(String::as_bytes).collect();
     link_image(&Link {
-        inputs: &files,
+        inputs: files,
         output: &opts.output,
         mode: mode_of(opts, shared),
         // A shared object has no entry point unless one is asked for, so the
@@ -360,6 +368,101 @@ fn link_macho_image(
     ad_hoc_sign(&opts.output)
 }
 
+/// The entry names this linker defaults to, one per output format: ELF
+/// enters at `_start`, COFF at `main`, and Mach-O at `_main`.
+const DEFAULT_ENTRIES: [&[u8]; 3] = [b"_start", b"main", b"_main"];
+
+/// Links a set of inputs that includes bitcode.
+///
+/// The plugin compiles the bitcode into ordinary relocatable objects, and
+/// those take its place in the input list. Everything after that is the
+/// normal ELF link: nothing downstream needs to know bitcode was ever here,
+/// which is the property that keeps LTO out of the rest of the linker.
+///
+/// The objects go in where the first bitcode input was, rather than at the
+/// end. Input order decides which archive member answers a reference, and the
+/// code the plugin compiled came from that position on the command line.
+fn link_bitcode(opts: &Options, list: &InputList) -> Result<()> {
+    let inputs: Vec<PathBuf> = list.paths().map(Path::to_path_buf).collect();
+    let kind = if opts.shared {
+        lto::Output::Shared
+    } else if opts.pie == Some(true) {
+        lto::Output::Pie
+    } else {
+        lto::Output::Executable
+    };
+    // The entry symbol and every `-u` name are pinned: nothing in any object
+    // references them, and LTO deletes what nothing reaches.
+    //
+    // Which name that is depends on the output format, and the format comes
+    // from the bitcode's own target triple -- which only the plugin can read,
+    // and only while compiling. The entry cannot be known before the compile
+    // that needs it pinned, so every default this linker would use is pinned
+    // instead. Pinning a name no input defines costs nothing; failing to pin
+    // the real one deletes the program, which is what an unpinned `main`
+    // looked like: an object with no code in it at all.
+    let mut pinned: Vec<&[u8]> =
+        opts.undefined.iter().map(String::as_bytes).collect();
+    if opts.entry_given {
+        pinned.push(opts.entry.as_bytes());
+    } else if !opts.shared {
+        pinned.extend_from_slice(&DEFAULT_ENTRIES);
+    }
+    let compiled = lto::compile(&lto::Job {
+        named_plugin: opts.lto_plugin.as_deref(),
+        options: &opts.lto_plugin_opts,
+        output: &opts.output,
+        kind,
+        inputs: &inputs,
+        pinned: &pinned,
+        export_all: opts.shared || opts.export_dynamic,
+    })?;
+    let files = list.views_with_lto(&compiled.objects);
+    let result = link_compiled(opts, &files, list, &compiled.objects);
+    // The plugin's objects are temporary files it removes here. Cleanup runs
+    // whether or not the link succeeded, and a link error outranks a cleanup
+    // one: the first says why no image was written.
+    let swept = compiled.finish();
+    result.and(swept)
+}
+
+/// Links the objects LTO produced, on the path their own format selects.
+///
+/// Bitcode carries its target triple, so what comes back may be ELF, COFF or
+/// Mach-O regardless of what the host is. The input scan could not have known
+/// -- it saw only bitcode -- so the choice is made here, from the first
+/// object the plugin returned.
+fn link_compiled(
+    opts: &Options,
+    files: &[Input<'_>],
+    list: &InputList,
+    objects: &[PathBuf],
+) -> Result<()> {
+    let mut head = [0u8; HEAD_LEN];
+    let format = objects
+        .first()
+        .and_then(|path| read_head(path, &mut head))
+        .and_then(|n| head.get(..n))
+        .and_then(Format::detect);
+    match format {
+        Some(Format::Coff) => {
+            refuse_macho_output_options(opts, "COFF")?;
+            refuse_elf_only(opts, "COFF")?;
+            let entry = default_entry(opts, b"main");
+            link_coff(files, &opts.output, entry, opts.shared)
+        }
+        Some(Format::MachO) => Err(Error::CommandLine(
+            "link-time optimisation produced Mach-O objects, which this \
+             link path does not yet consume"
+                .into(),
+        )),
+        // ELF, and anything the readers will reject by name themselves.
+        _ => link_elf(opts, files, list.scan.shared),
+    }
+}
+
+/// Refuses Mach-O output controls when another format's inputs selected its
+/// writer. These options change the image and therefore cannot be ignored.
 /// Refuses Mach-O output controls when another format's inputs selected its
 /// writer. These options change the image and therefore cannot be ignored.
 fn refuse_macho_output_options(
@@ -418,6 +521,10 @@ fn default_entry<'a>(opts: &'a Options, platform: &'a [u8]) -> &'a [u8] {
 }
 
 /// What the input set contains, and therefore which link path runs.
+/// Each field answers a separate question about the inputs, so grouping them
+/// would only hide what the scan found; the tree allows the lint on the other
+/// flag bags for the same reason.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Clone, Copy, Default)]
 struct InputScan {
     /// Some input is a Mach-O object.
@@ -431,6 +538,8 @@ struct InputScan {
     /// against. Inputs that disagree with each other are the link's own
     /// error, reported where the machine is derived.
     machine: Option<u16>,
+    /// Some input is LLVM IR bitcode, which only the LTO plugin can read.
+    bitcode: bool,
 }
 
 /// Bytes of each input read to classify it: enough for any format magic, for
@@ -462,6 +571,11 @@ struct Resolved {
     from_l: bool,
     /// Whether an `AS_NEEDED` list named it. See [`Input::AsNeeded`].
     as_needed: bool,
+    /// Whether the file holds LLVM IR bitcode, from the same head bytes the
+    /// format scan already read. Recorded rather than re-derived: the fold
+    /// that replaces these with compiled objects would otherwise open every
+    /// input a second time.
+    bitcode: bool,
 }
 
 /// The settled input list the link runs on, with the classification that
@@ -513,11 +627,65 @@ impl InputList {
                 path: path.clone(),
                 from_l: opts.from_l.get(i).copied().unwrap_or(false),
                 as_needed: opts.as_needed.get(i).copied().unwrap_or(false),
+                bitcode: false,
             };
             self.add(file, &search, SCRIPT_DEPTH)?;
             i += 1;
         }
         Ok(())
+    }
+
+    /// Every input with a path, in the order the command line named them.
+    /// Order is what decides which definition prevails, so the plugin must be
+    /// offered them in it.
+    fn paths(&self) -> impl Iterator<Item = &Path> {
+        self.files.iter().filter_map(|entry| match entry {
+            Entry::File(file) => Some(&*file.path),
+            // A `--start-lib` group has no path of its own; its members are
+            // held in memory, and offering one to the plugin needs the group
+            // reader that lazy bitcode extraction will bring.
+            Entry::Group { .. } => None,
+        })
+    }
+
+    /// The list as the linker takes it, with every bitcode input replaced by
+    /// the objects the LTO plugin compiled from it.
+    ///
+    /// The replacements are spliced in at the first bitcode input rather than
+    /// appended. Input order decides which archive member answers a
+    /// reference, and the compiled code came from that position.
+    fn views_with_lto<'a>(&'a self, objects: &'a [PathBuf]) -> Vec<Input<'a>> {
+        let mut out = Vec::with_capacity(self.files.len() + objects.len());
+        let mut spliced = false;
+        for entry in &self.files {
+            match entry {
+                Entry::File(file) if file.bitcode => {
+                    if !spliced {
+                        spliced = true;
+                        out.extend(
+                            objects.iter().map(|o| Input::Path(o.as_path())),
+                        );
+                    }
+                }
+                Entry::File(file) => out.push(Self::view_of(file)),
+                Entry::Group { name, bytes } => {
+                    out.push(Input::Memory { name, bytes });
+                }
+            }
+        }
+        out
+    }
+
+    /// One file entry as the linker takes it.
+    fn view_of(file: &Resolved) -> Input<'_> {
+        match (file.as_needed, file.from_l) {
+            (true, from_l) => Input::AsNeeded {
+                path: &file.path,
+                from_l,
+            },
+            (false, true) => Input::Library(&file.path),
+            (false, false) => Input::Path(&file.path),
+        }
     }
 
     /// The list as the linker takes it, with the `-l`-found and `AS_NEEDED`
@@ -546,7 +714,7 @@ impl InputList {
     /// selects opens it properly and says why it could not.
     fn add(
         &mut self,
-        file: Resolved,
+        mut file: Resolved,
         search: &Search<'_>,
         depth: usize,
     ) -> Result<()> {
@@ -602,6 +770,10 @@ impl InputList {
                 if self.scan.machine.is_none() {
                     self.scan.machine = elf_machine(head);
                 }
+            }
+            Some(Format::Bitcode) => {
+                self.scan.bitcode = true;
+                file.bitcode = true;
             }
             // A PE image is not a link input; it falls through to the reader
             // that says so.
@@ -663,6 +835,7 @@ impl InputList {
                     // as-needed libraries throughout: the enclosing directive
                     // applies to everything the script pulls in.
                     as_needed: name.as_needed || file.as_needed,
+                    bitcode: false,
                 },
                 search,
                 depth.saturating_sub(1),

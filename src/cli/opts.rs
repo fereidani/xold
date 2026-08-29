@@ -422,6 +422,10 @@ pub struct Parsed {
     pub macho_arch: Option<MachoTarget>,
     pub macho_platform: Option<PlatformVersion>,
     pub macho_dead_strip: bool,
+    /// `-plugin`: the LTO plugin the driver named, if any.
+    pub lto_plugin: Option<PathBuf>,
+    /// `-plugin-opt=`: options passed straight through to that plugin.
+    pub lto_plugin_opts: Vec<String>,
 }
 
 impl Default for Parsed {
@@ -451,6 +455,8 @@ impl Default for Parsed {
             macho_arch: None,
             macho_platform: None,
             macho_dead_strip: false,
+            lto_plugin: None,
+            lto_plugin_opts: Vec::new(),
         }
     }
 }
@@ -514,6 +520,8 @@ impl Parsed {
             macho_arch: self.macho_arch,
             macho_platform: self.macho_platform,
             macho_dead_strip: self.macho_dead_strip,
+            lto_plugin: self.lto_plugin,
+            lto_plugin_opts: self.lto_plugin_opts,
         }
     }
 }

@@ -597,10 +597,11 @@ fn extract_globals<'d>(obj: &ObjectFile<'d>) -> Result<Vec<InputSymbol<'d>>> {
     let Some(symtab) = obj.symbol_table()? else {
         return Ok(Vec::new());
     };
-    // Globals are a fraction of a symbol table, but sizing to the whole of it
-    // costs one allocation instead of a dozen regrowths, and the excess is
-    // released when the caller drops the list.
-    let mut out = Vec::with_capacity(symtab.syms.len());
+    // Sized from the table's own local/global split rather than its length:
+    // every one of these lists is live at once, across every input, so the
+    // slack sizing to the whole table would leave is paid for in peak memory
+    // and in pages the kernel has to zero.
+    let mut out = Vec::with_capacity(symtab.global_count());
     for (idx, sym) in symtab.iter().enumerate() {
         // Every symbol is checked, local ones included: a local resolves
         // through the same raw `st_shndx` and lands in the same wrong place.

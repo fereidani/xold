@@ -106,6 +106,9 @@ impl<'data> Relocs<'data> {
 pub struct SymbolTable<'data> {
     pub syms: &'data [Sym64],
     strtab: &'data [u8],
+    /// `sh_info`: the index of the first non-local symbol, clamped to the
+    /// table length. See [`Self::global_count`].
+    first_global: usize,
 }
 
 /// One `SHT_GROUP` (COMDAT) section: the signature that identifies the group,
@@ -540,6 +543,17 @@ impl<'data> SymbolTable<'data> {
         self.syms.iter()
     }
 
+    /// How many symbols can be non-local, from the table's own `sh_info`.
+    ///
+    /// ELF orders every local symbol before every global one, so this is an
+    /// exact upper bound on what a globals-only pass keeps -- the right size
+    /// for its output, rather than the whole table. Roughly half of a
+    /// compiler's symbol table is local, so sizing to the table over-reserves
+    /// by about that much on every input at once.
+    pub fn global_count(&self) -> usize {
+        self.syms.len().saturating_sub(self.first_global)
+    }
+
     /// Rejects a table whose `st_name` columns point past the string table.
     ///
     /// A corrupt offset would read as an empty name: two broken symbols
@@ -589,9 +603,15 @@ fn read_symbol_table<'data>(
         .ok_or(Error::OutOfRange("symbol string table index"))?;
     let syms: &'data [Sym64] =
         view_slice(bytes, symtab, core::mem::size_of::<Sym64>(), entries_what)?;
+    // ELF requires the local symbols to come first and `sh_info` to hold how
+    // many there are. It is a hint here, never a bound: it only sizes an
+    // allocation, so a file that misstates it costs a regrowth or some
+    // slack rather than a wrong answer. Clamping keeps it in range.
+    let first_global = (symtab.sh_info.get() as usize).min(syms.len());
     let table = SymbolTable {
         syms,
         strtab: section_payload(bytes, strtab, strtab_what)?,
+        first_global,
     };
     table.check_names(names_what)?;
     Ok(Some(table))

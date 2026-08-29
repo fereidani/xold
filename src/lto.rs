@@ -79,7 +79,7 @@ pub fn compile(job: &Job<'_>) -> Result<Compiled> {
     for name in job.pinned {
         regular.pin(name);
     }
-    let mut claimed = 0usize;
+    let mut count = 0usize;
     let mut archives: Vec<(PathBuf, Vec<u8>)> = Vec::new();
     for input in job.inputs {
         let bytes = std::fs::read(input).map_err(Error::Io)?;
@@ -88,7 +88,7 @@ pub fn compile(job: &Job<'_>) -> Result<Compiled> {
             continue;
         }
         match claimer.offer(input, bytes)? {
-            Offer::Claimed { .. } => claimed = claimed.saturating_add(1),
+            Offer::Claimed { .. } => count = count.saturating_add(1),
             // The plugin does not want it, so it is a regular input and its
             // names are the ones LTO must not assume it has seen every use
             // of. Re-reading is cheap next to compiling, and keeps the claim
@@ -103,14 +103,13 @@ pub fn compile(job: &Job<'_>) -> Result<Compiled> {
         .iter()
         .map(|(path, bytes)| (path.as_path(), bytes.as_slice()))
         .collect();
-    claimed =
-        claimed.saturating_add(claim_group_members(&claimer, job.groups)?);
-    claimed = claimed.saturating_add(claim_archive_members(
+    count = count.saturating_add(claim_group_members(&claimer, job.groups)?);
+    count = count.saturating_add(claim_archive_members(
         &claimer,
         &regular,
         &searchable,
     )?);
-    if claimed == 0 {
+    if count == 0 {
         return Ok(Compiled {
             plugin,
             objects: Vec::new(),
@@ -229,7 +228,7 @@ fn claim_archive_members(
         parsed.push(Archive::parse(bytes, path)?);
     }
     let mut taken: FxHashSet<(usize, u64)> = FxHashSet::default();
-    let mut claimed = 0usize;
+    let mut count = 0usize;
     // A round claims at least one member or the sweep is done, and every
     // member a lookup can reach is named by an index entry, so the total
     // number of indexed symbols bounds the walk. Taking the bound from the
@@ -271,7 +270,7 @@ fn claim_archive_members(
                 if let Offer::Claimed { .. } =
                     claimer.offer(&named, member.into_owned())?
                 {
-                    claimed = claimed.saturating_add(1);
+                    count = count.saturating_add(1);
                     progressed = true;
                 }
             }
@@ -280,7 +279,7 @@ fn claim_archive_members(
             break;
         }
     }
-    Ok(claimed)
+    Ok(count)
 }
 
 /// Claims every bitcode member of a `--start-lib` group.
@@ -299,7 +298,7 @@ fn claim_group_members(
     claimer: &Claimer<'_>,
     groups: &[(&Path, &[u8])],
 ) -> Result<usize> {
-    let mut claimed = 0usize;
+    let mut count = 0usize;
     for (name, bytes) in groups {
         for (index, member) in
             crate::archive::members(bytes)?.iter().enumerate()
@@ -311,9 +310,9 @@ fn claim_group_members(
             if let Offer::Claimed { .. } =
                 claimer.offer(&label, (*member).to_vec())?
             {
-                claimed = claimed.saturating_add(1);
+                count = count.saturating_add(1);
             }
         }
     }
-    Ok(claimed)
+    Ok(count)
 }

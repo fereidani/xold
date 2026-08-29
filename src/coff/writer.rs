@@ -952,12 +952,19 @@ fn write_headers(
     let _ = write_section_table(image, off, layout);
 }
 
-/// The `IMAGE_FILE_*` characteristics: an executable sets `EXECUTABLE_IMAGE`,
-/// a DLL sets `DLL`. Both strip line numbers and locals and are large-address-
-/// aware.
+/// The `IMAGE_FILE_*` characteristics: every image sets `EXECUTABLE_IMAGE`,
+/// and a DLL adds `DLL` on top of it. Both strip line numbers and locals and
+/// are large-address-aware.
+///
+/// `EXECUTABLE_IMAGE` says the file is a linked image rather than a relocatable
+/// object, which a DLL is just as much as a program. lld sets it
+/// unconditionally and only ors `DLL` in on top for a shared image
+/// (`lld/COFF/Writer.cpp`); setting `DLL` alone leaves the header claiming the
+/// file was never linked, which loaders and signing tools are entitled to
+/// reject.
 fn file_characteristics(is_dll: bool) -> u16 {
     let mode = if is_dll {
-        IMAGE_FILE_DLL
+        IMAGE_FILE_EXECUTABLE_IMAGE | IMAGE_FILE_DLL
     } else {
         IMAGE_FILE_EXECUTABLE_IMAGE
     };

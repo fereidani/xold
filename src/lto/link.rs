@@ -16,6 +16,7 @@
 use rustc_hash::FxHashMap;
 
 use crate::{
+    coff::CoffFile,
     elf::{
         ObjectFile,
         constants::{SHN_COMMON, SHN_UNDEF, STB_WEAK},
@@ -29,6 +30,10 @@ use crate::{
         },
         resolve::{Facts, Winner, resolution},
         session,
+    },
+    macho::{
+        MachOFile,
+        constants::{N_EXT, N_TYPE, N_UNDF, N_WEAK_DEF},
     },
 };
 
@@ -80,15 +85,79 @@ impl Regular {
     ///
     /// Reports an input that identifies as ELF and then does not parse.
     pub fn add_object(&mut self, bytes: &[u8]) -> Result<()> {
-        if Format::detect(bytes) != Some(Format::Elf) {
-            return Ok(());
+        match Format::detect(bytes) {
+            Some(Format::Elf) => self.add_elf(bytes),
+            Some(Format::Coff) => self.add_coff(bytes),
+            Some(Format::MachO) => self.add_macho(bytes),
+            _ => Ok(()),
         }
+    }
+
+    /// Records the names one ELF input contributes.
+    fn add_elf(&mut self, bytes: &[u8]) -> Result<()> {
         let obj = ObjectFile::parse(bytes)?;
         if obj.is_relocatable() {
             return self.add_relocatable(bytes);
         }
         for name in exported_names(&obj) {
             self.entry(&name).shared = true;
+        }
+        Ok(())
+    }
+
+    /// Records the external names one COFF object contributes.
+    ///
+    /// A COFF or Mach-O link runs the plugin exactly as an ELF one does, so
+    /// reading only ELF here left every native reference invisible: the
+    /// plugin was told each bitcode definition was `IRONLY`, which is a
+    /// licence to internalise or delete a symbol a native object still calls.
+    fn add_coff(&mut self, bytes: &[u8]) -> Result<()> {
+        let obj = CoffFile::parse(bytes)?;
+        for sym in obj.symbols() {
+            if !sym.is_external() && !sym.is_weak() {
+                continue;
+            }
+            let slot = self.entry(sym.name);
+            slot.used = true;
+            if sym.is_undefined() {
+                continue;
+            }
+            let rank = if sym.is_weak() {
+                3
+            } else if sym.is_common() {
+                2
+            } else {
+                1
+            };
+            slot.def_rank =
+                Some(slot.def_rank.map_or(rank, |best| best.min(rank)));
+        }
+        Ok(())
+    }
+
+    /// Records the external names one Mach-O object contributes.
+    fn add_macho(&mut self, bytes: &[u8]) -> Result<()> {
+        let obj = MachOFile::parse(bytes)?;
+        for sym in &obj.symbols() {
+            if sym.is_stab() || sym.n_type & N_EXT == 0 {
+                continue;
+            }
+            let slot = self.entry(sym.name);
+            slot.used = true;
+            let undefined = sym.n_type & N_TYPE == N_UNDF;
+            // A tentative definition is `N_UNDF` with a size, as in ELF.
+            if undefined && sym.n_value == 0 {
+                continue;
+            }
+            let rank = if sym.n_desc & N_WEAK_DEF != 0 {
+                3
+            } else if undefined {
+                2
+            } else {
+                1
+            };
+            slot.def_rank =
+                Some(slot.def_rank.map_or(rank, |best| best.min(rank)));
         }
         Ok(())
     }

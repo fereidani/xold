@@ -252,6 +252,13 @@ pub enum Format {
     /// PE image (`.exe`/`.dll`), identified by the `MZ` DOS stub. Wraps a
     /// COFF object; produced by the COFF writer, never taken as link input.
     Pe,
+    /// LLVM IR bitcode, in either the bare (`BC\xc0\xde`) or the wrapped
+    /// spelling a compiler emits for `-flto`.
+    ///
+    /// Not a format any of the writers consume. It is identified so that the
+    /// link can hand it to the LTO plugin, and so that a link without one can
+    /// say what the file is rather than that it is unrecognised.
+    Bitcode,
 }
 
 impl Format {
@@ -266,6 +273,7 @@ impl Format {
         let magic: [u8; 4] = bytes.get(..4)?.try_into().ok()?;
         match magic {
             ELFMAGIC => Some(Self::Elf),
+            BITCODE_MAGIC | BITCODE_WRAPPER_MAGIC => Some(Self::Bitcode),
             MH_MAGIC_BE_64 | MH_MAGIC_LE_64 | MH_MAGIC_BE_32
             | MH_MAGIC_LE_32 | FAT_MAGIC_BE | FAT_MAGIC_BE_64 => {
                 Some(Self::MachO)
@@ -278,6 +286,11 @@ impl Format {
 
 // ELF magic: `\x7fELF`.
 const ELFMAGIC: [u8; 4] = [0x7f, b'E', b'L', b'F'];
+// LLVM IR bitcode, as `clang -flto -c` writes it.
+const BITCODE_MAGIC: [u8; 4] = *b"BC\xc0\xde";
+// The bitcode wrapper header, `0x0b17c0de` little-endian. Darwin toolchains
+// emit it; the payload it points at is ordinary bitcode.
+const BITCODE_WRAPPER_MAGIC: [u8; 4] = [0xde, 0xc0, 0x17, 0x0b];
 // Mach-O 64-bit, big-endian and little-endian on-disk byte orders.
 const MH_MAGIC_BE_64: [u8; 4] = [0xfe, 0xed, 0xfa, 0xcf];
 const MH_MAGIC_LE_64: [u8; 4] = [0xcf, 0xfa, 0xed, 0xfe];

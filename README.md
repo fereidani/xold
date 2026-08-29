@@ -153,6 +153,13 @@ code beside the bytecode; such an object links like any other.
   relocations and `__declspec(thread)` TLS.
 - **Mach-O**: static executables for x86-64 and arm64. Dynamic output is not
   implemented.
+- **Link-time optimisation**, through the same plugin interface gold and
+  `ld.bfd` use: `clang -flto` and `-flto=thin` inputs are compiled by
+  `LLVMgold.so` and linked as ordinary objects, on any of the three output
+  formats. `-plugin` and `-plugin-opt=` are honoured, bitcode is extracted
+  from archives and `--start-lib` groups the way native objects are, and LLVM
+  stays out of the build: the plugin is loaded at run time, not linked
+  against.
 - Size and speed passes: `--gc-sections`, `--icf=all|safe`, `--strip-all`,
   `--strip-debug`, and relaxation of GOT-relative sequences.
 - The command line a driver writes: `-m`, `-pie`, `-z`, `--as-needed`,

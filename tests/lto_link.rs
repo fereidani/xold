@@ -341,6 +341,54 @@ fn darwin_bitcode_produces_a_macho_image() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+/// Two `ThinLTO` modules link across the boundary between them.
+///
+/// `ThinLTO` needs nothing of its own here: the mode is a property of the
+/// bitcode, and `-plugin-opt=` carries the options straight through to the
+/// plugin. What this checks is that a cross-module reference resolves, which
+/// is the case a single-file test cannot reach.
+#[test]
+#[cfg_attr(miri, ignore = "needs a host plugin and toolchain")]
+fn two_thin_lto_modules_link_across_the_boundary() {
+    let Some(dir) = workdir("thin") else {
+        return;
+    };
+    let Some(lib) = thin(&dir, "a", b"int helper(void){return 7;}\n") else {
+        return;
+    };
+    let Some(user) = thin(
+        &dir,
+        "b",
+        b"int helper(void);\nint main(void){return helper();}\n",
+    ) else {
+        return;
+    };
+    let (Some(start), Some(open), Some(close)) =
+        (crt_file("crt1.o"), crt_file("crti.o"), crt_file("crtn.o"))
+    else {
+        eprintln!("skipping thin lto: no crt objects on this host");
+        return;
+    };
+    let out = dir.join("prog");
+    let linked = Command::new(xold_bin())
+        .args([&start, &open, &lib, &user])
+        .arg("-lc")
+        .arg(&close)
+        .arg("-o")
+        .arg(&out)
+        .args(["--dynamic-exec", "-plugin-opt=jobs=2"])
+        .output()
+        .expect("run xold");
+    assert!(
+        linked.status.success(),
+        "a ThinLTO link must succeed: {}",
+        String::from_utf8_lossy(&linked.stderr)
+    );
+    let run = Command::new(&out).status().expect("the image must run");
+    assert_eq!(run.code(), Some(7), "the cross-module call resolves");
+    let _ = fs::remove_dir_all(&dir);
+}
+
 // --- fixtures --------------------------------------------------------------
 
 /// A working directory, or `None` when the host cannot run these at all.
@@ -372,6 +420,16 @@ fn bitcode(
     )?;
     // A clang configured for fat objects gives a native file, which is a
     // different shape than the one under test.
+    if !fs::read(&obj).is_ok_and(|b| b.starts_with(b"BC\xc0\xde")) {
+        eprintln!("skipping: this clang emits fat LTO objects");
+        return None;
+    }
+    Some(obj)
+}
+
+/// Compiles `source` to `ThinLTO` bitcode.
+fn thin(dir: &Path, stem: &str, source: &[u8]) -> Option<PathBuf> {
+    let obj = build(dir, stem, source, &["-flto=thin", "-c"])?;
     if !fs::read(&obj).is_ok_and(|b| b.starts_with(b"BC\xc0\xde")) {
         eprintln!("skipping: this clang emits fat LTO objects");
         return None;

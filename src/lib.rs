@@ -96,6 +96,7 @@ pub mod icf;
 pub mod input;
 pub mod layout;
 pub mod linker;
+pub mod lto;
 pub mod macho;
 pub mod merge;
 pub mod mmap_file;

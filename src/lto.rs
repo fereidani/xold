@@ -36,7 +36,7 @@ use std::path::{Path, PathBuf};
 pub use claim::{Claimer, Offer};
 pub use link::{Regular, resolve_claimed};
 pub use plugin::{Hooks, Output, Plugin};
-pub use resolve::{Facts, Winner, resolution};
+pub use resolve::{Facts, Role, Winner, resolution};
 use rustc_hash::FxHashSet;
 
 use crate::{

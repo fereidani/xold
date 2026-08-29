@@ -48,14 +48,26 @@ pub enum Winner {
     Shared,
 }
 
+/// What became of one declaration in the file being asked about.
+///
+/// The three states were two bools, `defined` and `prevailing`, which between
+/// them could spell a fourth that means nothing: a reference cannot prevail.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Role {
+    /// A reference rather than a definition.
+    Reference,
+    /// A definition another file's copy outranked. Commons count as
+    /// definitions here: they are ones the link may still replace.
+    Preempted,
+    /// The definition that won the name.
+    Prevailing,
+}
+
 /// What the link knows about one symbol a plugin declared.
 #[derive(Clone, Copy, Debug)]
 pub struct Facts {
-    /// The bitcode declared this as a definition rather than a reference.
-    /// Commons count: they are definitions the link may still replace.
-    pub defined: bool,
-    /// The winning definition is the one in the file being asked about.
-    pub prevailing: bool,
+    /// What became of this file's declaration of the name.
+    pub role: Role,
     /// Where the winning definition lives.
     pub winner: Winner,
     /// A regular object, a linker script, `-u`, or the entry symbol names
@@ -70,32 +82,32 @@ pub struct Facts {
 /// The `LDPR_*` value describing `facts`.
 #[must_use]
 pub const fn resolution(facts: &Facts) -> c_uint {
-    if !facts.defined {
-        return match facts.winner {
+    match facts.role {
+        Role::Reference => match facts.winner {
             Winner::Nowhere => LDPR_UNDEF,
             Winner::Regular => LDPR_RESOLVED_EXEC,
             Winner::Bitcode => LDPR_RESOLVED_IR,
             Winner::Shared => LDPR_RESOLVED_DYN,
-        };
-    }
-    if !facts.prevailing {
+        },
         // Another definition won. Only a real definition can outrank one, so
         // the winner is an object or another bitcode file; a shared library
         // never preempts a definition at link time, and reporting it as a
         // regular preemption is the answer that keeps this file's copy out of
         // the image either way.
-        return match facts.winner {
+        Role::Preempted => match facts.winner {
             Winner::Bitcode => LDPR_PREEMPTED_IR,
             _ => LDPR_PREEMPTED_REG,
-        };
-    }
-    // This file's definition won. What remains is who can see it.
-    if facts.used_in_regular_obj {
-        LDPR_PREVAILING_DEF
-    } else if facts.exported {
-        LDPR_PREVAILING_DEF_IRONLY_EXP
-    } else {
-        LDPR_PREVAILING_DEF_IRONLY
+        },
+        // This file's definition won. What remains is who can see it.
+        Role::Prevailing => {
+            if facts.used_in_regular_obj {
+                LDPR_PREVAILING_DEF
+            } else if facts.exported {
+                LDPR_PREVAILING_DEF_IRONLY_EXP
+            } else {
+                LDPR_PREVAILING_DEF_IRONLY
+            }
+        }
     }
 }
 

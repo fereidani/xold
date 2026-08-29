@@ -28,7 +28,7 @@ use crate::{
             LDPK_COMMON, LDPK_DEF, LDPK_WEAKDEF, LDPK_WEAKUNDEF, LDPV_DEFAULT,
             LDPV_PROTECTED,
         },
-        resolve::{Facts, Winner, resolution},
+        resolve::{Facts, Role, Winner, resolution},
         session,
     },
     macho::{
@@ -341,9 +341,15 @@ pub fn resolve_claimed(regular: &Regular, export_all: bool) -> Result<()> {
             } else {
                 Winner::Nowhere
             };
+            let role = if !defined {
+                Role::Reference
+            } else if !outranked && owner == Some(file.handle) {
+                Role::Prevailing
+            } else {
+                Role::Preempted
+            };
             let facts = Facts {
-                defined,
-                prevailing: defined && !outranked && owner == Some(file.handle),
+                role,
                 winner: where_,
                 used_in_regular_obj: seen.used,
                 // Protected is exported just as default is: it cannot be

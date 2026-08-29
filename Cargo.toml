@@ -33,6 +33,7 @@ object = "0.39"
 [profile.perf]
 inherits = "release"
 debug = 1
+strip = false
 
 [profile.release]
 debug = 0

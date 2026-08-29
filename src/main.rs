@@ -58,6 +58,10 @@ use xold::{
 static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 fn main() -> ExitCode {
+    // This process exists only to link, so it is free to trade transparent
+    // huge pages away on a link large enough to be hurt by them. The library
+    // never decides this for a host that did not ask.
+    xold::pool::allow_huge_page_tuning();
     let raw: Vec<OsString> = env::args_os().skip(1).collect();
     let args = match expand_response_files(&raw) {
         Ok(args) => args,

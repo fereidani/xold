@@ -14,7 +14,11 @@
 //! paths run the same code over the same data, so the image is the same bytes
 //! either way; `tests/pool_threshold.rs` pins that.
 
-use std::{env, ops::Range};
+use std::{
+    env,
+    ops::Range,
+    sync::atomic::{AtomicBool, Ordering},
+};
 
 use rayon::ThreadPoolBuilder;
 
@@ -93,12 +97,109 @@ fn content_bytes(input: &[u8]) -> u64 {
 /// clock but far worse in CPU is still worth taking serially, because under
 /// `make -j` that CPU comes out of a concurrent compile.
 pub fn fans_out(inputs: &[&[u8]]) -> bool {
+    work_estimate(inputs) >= WORK_THRESHOLD
+}
+
+/// The estimated work in `inputs`: their [`content_bytes`] plus
+/// [`FILE_WORK`] each. Two decisions read it, so it is computed once.
+fn work_estimate(inputs: &[&[u8]]) -> u64 {
     let bytes = inputs
         .iter()
         .map(|b| content_bytes(b))
         .fold(0u64, u64::saturating_add);
     let files = u64::try_from(inputs.len()).unwrap_or(u64::MAX);
-    bytes.saturating_add(files.saturating_mul(FILE_WORK)) >= WORK_THRESHOLD
+    bytes.saturating_add(files.saturating_mul(FILE_WORK))
+}
+
+/// The estimated work above which transparent huge pages stop paying.
+///
+/// mimalloc reserves a 1 GiB arena and marks all of it `MADV_HUGEPAGE`, so
+/// every anonymous allocation a link makes faults as a 2 MiB page. Two costs
+/// follow. A huge page is zeroed in full on first touch, and a link writes
+/// its arena sparsely and once -- it streams through its inputs rather than
+/// revisiting a working set -- so the TLB reuse that pays for huge pages
+/// elsewhere never accrues. And under Linux's default `defrag=madvise` a
+/// fault with no free 2 MiB block compacts *synchronously* in the faulting
+/// thread, which is a stall no other thread overlaps. On the host this was
+/// fitted on, 92% of the kernel's compaction attempts were already failing.
+///
+/// # What this was fitted to
+///
+/// 600 independent objects of about 0.77 MB each, linked as a dynamic
+/// executable in prefixes; medians of 11 interleaved pairs per row, with
+/// memory compacted before each row so no row inherits the previous one's
+/// fragmentation. The ratio is huge-pages-off over huge-pages-on, so below
+/// 1.0 turning them off wins.
+///
+/// | objects | estimate | ratio | disabled |
+/// |---|---|---|---|
+/// | 120 | 96 MB | 1.185 | no |
+/// | 200 | 160 MB | 0.702 | no |
+/// | 280 | 224 MB | 0.723 | no |
+/// | 360 | 288 MB | 0.705 | yes |
+/// | 440 | 353 MB | 0.680 | yes |
+/// | 520 | 417 MB | 0.650 | yes |
+/// | 600 | 481 MB | 0.602 | yes |
+///
+/// The real corpora agree at both ends: the 2864-object LLVM link (389 MB
+/// estimated) measured 0.68x to 0.79x across four sessions and never once
+/// preferred huge pages, while a 121-object C corpus (51 MB) measured 1.115x
+/// and the same corpus against `libc.a` (81 MB) 1.091x.
+///
+/// # Why not at the crossover
+///
+/// The sweep puts the crossover between 96 MB and 160 MB, but two real
+/// corpora sitting at 229 MB and 238 MB -- the same C++ objects linked shared
+/// and dynamic -- changed sign between sessions, measuring 1.05x once and
+/// 0.86x another time. Most of their bulk is DWARF, which is copied from one
+/// mapping to another rather than held on the heap, so the byte estimate
+/// overstates the anonymous footprint that actually faults. The threshold
+/// therefore sits above them rather than at the crossover: every shape at or
+/// above 256 MB won in every session it was measured in, and no shape below
+/// it is put at risk. The cost of the choice is the 160 MB and 224 MB rows,
+/// which give up a measured 0.70x.
+///
+/// # If this is re-fitted
+///
+/// The crossover moves with how fragmented the host's memory is, which is
+/// what makes it worth a threshold rather than an unconditional call: on a
+/// long-lived, fragmented machine turning huge pages off won every row of
+/// the sweep, including the ones that prefer them here. Compact memory
+/// (`/proc/sys/vm/compact_memory`) before each row, or the measurement reads
+/// the previous row's fragmentation rather than the workload.
+const HUGE_PAGE_THRESHOLD: u64 = 256 * 1024 * 1024;
+
+/// Whether the process has allowed its huge-page policy to be changed.
+///
+/// Off unless [`allow_huge_page_tuning`] is called. The policy is
+/// process-wide and permanent, which is the application's call to make and
+/// not a library's: a host that links once and then runs for hours would
+/// otherwise lose huge pages everywhere on the strength of that one link.
+static TUNE_HUGE_PAGES: AtomicBool = AtomicBool::new(false);
+
+/// Lets a link turn transparent huge pages off when the workload is large
+/// enough to be hurt by them. See [`HUGE_PAGE_THRESHOLD`].
+///
+/// Intended for the `xold` binary, whose process exists only to link.
+pub fn allow_huge_page_tuning() {
+    TUNE_HUGE_PAGES.store(true, Ordering::Relaxed);
+}
+
+/// Opts the process out of transparent huge pages, if it allowed it.
+#[cfg(target_os = "linux")]
+fn disable_huge_pages() {
+    if !TUNE_HUGE_PAGES.load(Ordering::Relaxed) {
+        return;
+    }
+    // SAFETY: `prctl` is variadic; this option takes its four arguments by
+    // value and reads no memory through them, so the call borrows nothing.
+    // A kernel that does not know the option answers -1/EINVAL, which needs
+    // no handling: huge pages stay on and the link is slower but correct.
+    let rc = unsafe {
+        libc::prctl(libc::PR_SET_THP_DISABLE, 1_u64, 0_u64, 0_u64, 0_u64)
+    };
+    debug_assert!(rc == 0 || rc == -1, "prctl answers 0 or -1");
+    let _ = rc;
 }
 
 /// Runs `job` on a thread pool sized for `inputs`.
@@ -111,9 +212,16 @@ pub(crate) fn run<T: Send>(
     inputs: &[&[u8]],
     job: impl FnOnce() -> T + Send,
 ) -> T {
+    let work = work_estimate(inputs);
+    // Taken before any parallel pass starts, so the arena is still mostly
+    // untouched and the policy applies to the faults that matter.
+    #[cfg(target_os = "linux")]
+    if work >= HUGE_PAGE_THRESHOLD {
+        disable_huge_pages();
+    }
     if env::var_os(THREAD_VAR).is_some()
         || rayon::current_thread_index().is_some()
-        || fans_out(inputs)
+        || work >= WORK_THRESHOLD
     {
         return job();
     }

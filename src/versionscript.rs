@@ -43,7 +43,8 @@ use crate::error::{Error, Result};
 enum Pattern {
     /// A name written out in full.
     Exact(Vec<u8>),
-    /// A glob: `*` matches any run of bytes, `?` matches one.
+    /// A glob: `*` matches any run of bytes, `?` matches one, `[...]` is a
+    /// character class and `\` escapes the byte after it.
     Glob(Vec<u8>),
 }
 
@@ -150,11 +151,11 @@ pub fn parse(path: &str, text: &str) -> Result<VersionScript> {
         match strip_label(entry) {
             Some(("global", rest)) => {
                 local = false;
-                push(&mut script, local, rest);
+                push(path, &mut script, local, rest)?;
             }
             Some(("local", rest)) => {
                 local = true;
-                push(&mut script, local, rest);
+                push(path, &mut script, local, rest)?;
             }
             Some((other, _)) => {
                 return Err(script_error(
@@ -162,7 +163,7 @@ pub fn parse(path: &str, text: &str) -> Result<VersionScript> {
                     format!("`{other}:` is not a version script label"),
                 ));
             }
-            None => push(&mut script, local, entry),
+            None => push(path, &mut script, local, entry)?,
         }
     }
     Ok(script)
@@ -176,11 +177,25 @@ fn strip_label(entry: &str) -> Option<(&str, &str)> {
 }
 
 /// Adds one name to the list in force.
-fn push(script: &mut VersionScript, local: bool, name: &str) {
+///
+/// The token is classified while it still has its quotes and stored without
+/// them, which is the order lld's `readSymbols` uses: it pushes
+/// `{unquote(tok), hasWildcard(tok)}` (`lld/ELF/ScriptParser.cpp`). So
+/// `"foo*"` is a glob whose quotes never reach the matcher, where treating
+/// the token literally would leave a pattern no symbol can match.
+fn push(
+    path: &str,
+    script: &mut VersionScript,
+    local: bool,
+    name: &str,
+) -> Result<()> {
     if name.is_empty() {
-        return;
+        return Ok(());
     }
-    let pattern = if name.contains('*') || name.contains('?') {
+    let wildcard = has_wildcard(name);
+    let name = unquote(name);
+    let pattern = if wildcard {
+        validate_glob(path, name)?;
         Pattern::Glob(name.as_bytes().to_vec())
     } else {
         Pattern::Exact(name.as_bytes().to_vec())
@@ -190,6 +205,98 @@ fn push(script: &mut VersionScript, local: bool, name: &str) {
     } else {
         script.global.push(pattern);
     }
+    Ok(())
+}
+
+/// Whether a version-script token is a pattern rather than a plain name.
+///
+/// The set is lld's `hasWildcard`, `find_first_of("?*[")`: a character class
+/// makes a token a pattern just as much as a star does, and reading `[` as an
+/// ordinary byte turns `api_[0-9]*` into a name nothing is called.
+fn has_wildcard(token: &str) -> bool {
+    token.bytes().any(|c| matches!(c, b'?' | b'*' | b'['))
+}
+
+/// Strips one pair of surrounding double quotes, after lld's `unquote`.
+fn unquote(token: &str) -> &str {
+    token
+        .strip_prefix('"')
+        .and_then(|rest| rest.strip_suffix('"'))
+        .unwrap_or(token)
+}
+
+/// Rejects a glob that cannot be given a meaning: an unterminated character
+/// class, or a range written backwards. `GlobPattern::create` reports the
+/// same two, and refusing here keeps a silent non-match from hiding an
+/// export the script meant to publish.
+fn validate_glob(path: &str, pattern: &str) -> Result<()> {
+    let bytes = pattern.as_bytes();
+    let mut i = 0usize;
+    // Every arm advances `i`, so the walk is bounded by the pattern length.
+    while let Some(&c) = bytes.get(i) {
+        match c {
+            b'\\' => i = i.saturating_add(2),
+            b'[' => {
+                let end = class_end(bytes, i).ok_or_else(|| {
+                    script_error(
+                        path,
+                        format!("unterminated `[` in pattern `{pattern}`"),
+                    )
+                })?;
+                check_ranges(path, pattern, bytes, i, end)?;
+                i = end;
+            }
+            _ => i = i.saturating_add(1),
+        }
+    }
+    Ok(())
+}
+
+/// The index just past the `]` closing the class that opens at `open`.
+///
+/// The byte right after `[` is a member even when it is `]`, so the search
+/// starts one past it; this is what `GlobPattern` does.
+fn class_end(bytes: &[u8], open: usize) -> Option<usize> {
+    let first = open.checked_add(1)?;
+    let first = if matches!(bytes.get(first), Some(b'^' | b'!')) {
+        first.checked_add(1)?
+    } else {
+        first
+    };
+    let from = first.checked_add(1)?;
+    let at = bytes.get(from..)?.iter().position(|&c| c == b']')?;
+    from.checked_add(at)?.checked_add(1)
+}
+
+/// Reports a `X-Y` range inside a class whose ends are the wrong way round.
+fn check_ranges(
+    path: &str,
+    pattern: &str,
+    bytes: &[u8],
+    open: usize,
+    end: usize,
+) -> Result<()> {
+    let mut i = open.saturating_add(1);
+    // Bounded by the class extent, which the caller already located.
+    while i < end.saturating_sub(1) {
+        let (Some(&start), Some(&dash), Some(&last)) =
+            (bytes.get(i), bytes.get(i + 1), bytes.get(i + 2))
+        else {
+            return Ok(());
+        };
+        if dash == b'-' && last != b']' {
+            if start > last {
+                return Err(script_error(
+                    path,
+                    format!("reversed range in pattern `{pattern}`"),
+                ));
+            }
+            i = i.saturating_add(3);
+        } else {
+            i = i.saturating_add(1);
+        }
+    }
+    Ok(())
 }
 
 /// Extracts the body of the one anonymous version node, refusing the forms
@@ -261,8 +368,8 @@ fn strip_comments(text: &str) -> String {
     }
 }
 
-/// Whether `pattern` matches `name`, with `*` for any run of bytes and `?`
-/// for one.
+/// Whether `pattern` matches `name`, with `*` for any run of bytes, `?` for
+/// one, `[...]` for a character class and `\` to escape the byte after it.
 ///
 /// Iterative rather than recursive, with a remembered star position, so the
 /// worst case is bounded by the product of the two lengths and the stack
@@ -271,24 +378,24 @@ fn glob(pattern: &[u8], name: &[u8]) -> bool {
     let (mut p, mut n) = (0usize, 0usize);
     let (mut star, mut retry) = (None, 0usize);
     while n < name.len() {
-        match pattern.get(p) {
-            Some(b'*') => {
-                star = Some(p);
-                retry = n;
-                p += 1;
+        if pattern.get(p) == Some(&b'*') {
+            star = Some(p);
+            retry = n;
+            p = p.saturating_add(1);
+            continue;
+        }
+        match one(pattern, p, name[n]) {
+            Some(next) => {
+                p = next;
+                n = n.saturating_add(1);
             }
-            Some(b'?') => {
-                p += 1;
-                n += 1;
-            }
-            Some(&c) if c == name[n] => {
-                p += 1;
-                n += 1;
-            }
-            _ => match star {
+            // Reconsider the last `*`, letting it swallow one more byte. Each
+            // retry raises `retry`, so `n` reaches `name.len()` and the loop
+            // ends whether or not a match is found.
+            None => match star {
                 Some(at) => {
-                    p = at + 1;
-                    retry += 1;
+                    p = at.saturating_add(1);
+                    retry = retry.saturating_add(1);
                     n = retry;
                 }
                 None => return false,
@@ -298,6 +405,65 @@ fn glob(pattern: &[u8], name: &[u8]) -> bool {
     pattern
         .get(p..)
         .is_some_and(|rest| rest.iter().all(|&c| c == b'*'))
+}
+
+/// Matches the single pattern element at `p` against `byte`, returning the
+/// position just past that element.
+///
+/// `None` means the element did not match, which includes a malformed class:
+/// `validate_glob` rejects those at parse time, so reaching one here can only
+/// mean no match.
+fn one(pattern: &[u8], p: usize, byte: u8) -> Option<usize> {
+    match pattern.get(p)? {
+        b'?' => p.checked_add(1),
+        b'[' => {
+            let end = class_end(pattern, p)?;
+            in_class(pattern, p, end, byte).then_some(end)
+        }
+        b'\\' => {
+            let literal = *pattern.get(p.checked_add(1)?)?;
+            (literal == byte).then(|| p.saturating_add(2))
+        }
+        &c => (c == byte).then(|| p.saturating_add(1)),
+    }
+}
+
+/// Whether `byte` is in the class spanning `open..end`.
+///
+/// A leading `^` or `!` inverts the set, `X-Y` names an inclusive range, and
+/// a `]` in the first position is a member rather than the terminator. This
+/// is the set LLVM's `GlobPattern` accepts, which is what lld matches
+/// version-script patterns with.
+fn in_class(pattern: &[u8], open: usize, end: usize, byte: u8) -> bool {
+    let mut i = open.saturating_add(1);
+    let invert = matches!(pattern.get(i), Some(b'^' | b'!'));
+    if invert {
+        i = i.saturating_add(1);
+    }
+    let mut hit = false;
+    // `end` is one past the closing `]`, so the walk is bounded by the class.
+    while i < end.saturating_sub(1) {
+        let Some(&c) = pattern.get(i) else {
+            break;
+        };
+        if pattern.get(i.saturating_add(1)) == Some(&b'-')
+            && pattern
+                .get(i.saturating_add(2))
+                .is_some_and(|&last| last != b']')
+        {
+            let last = pattern.get(i.saturating_add(2)).copied().unwrap_or(c);
+            if (c..=last).contains(&byte) {
+                hit = true;
+            }
+            i = i.saturating_add(3);
+            continue;
+        }
+        if c == byte {
+            hit = true;
+        }
+        i = i.saturating_add(1);
+    }
+    hit != invert
 }
 
 /// A diagnostic naming the script and what was wrong with it.

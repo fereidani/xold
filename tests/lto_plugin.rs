@@ -1,3 +1,7 @@
+// The plugin host these exercise is compiled in only with the `lto`
+// feature, so without it there is nothing here to test.
+#![cfg(feature = "lto")]
+
 //! The LTO plugin boundary: detection of bitcode, and loading a real plugin.
 //!
 //! Bitcode is the one input shape a compiler produces that none of the
@@ -328,4 +332,65 @@ fn windows_targeted_bitcode_is_claimed_too() {
     };
     assert!(symbols >= 2, "`main` and `helper` are declared");
     let _ = fs::remove_dir_all(&dir);
+}
+
+/// A plugin calls `LDPT_MESSAGE` through a variadic pointer, so the callback
+/// has to read its two named arguments correctly when extra ones are passed.
+///
+/// `session::message` is declared without `...`, which is what keeps the
+/// crate buildable on stable Rust: defining a C-variadic function needs the
+/// unstable `c_variadic` feature. That is only sound because a callee reading
+/// just the named parameters cannot observe how it was declared. This calls
+/// it exactly as a plugin does -- through the variadic type, with a string
+/// and a float among the arguments, since a float is what makes an x86-64
+/// caller set `al` -- and checks that both named arguments still arrive.
+///
+/// The call runs in a child so the parent can read what reached stderr.
+#[test]
+fn the_message_callback_reads_its_named_arguments() {
+    use std::{env, ffi::c_char, mem, os::raw::c_int};
+
+    const VAR: &str = "XOLD_TEST_PLUGIN_MESSAGE";
+    type Message = unsafe extern "C" fn(c_int, *const c_char, ...);
+
+    if env::var_os(VAR).is_some() {
+        // SAFETY: the two types differ only in the trailing `...`. Every
+        // target this builds for passes the named arguments in the same
+        // places either way, and the callee reads nothing else; see the
+        // `session::message` documentation for the per-ABI argument.
+        let call: Message =
+            unsafe { mem::transmute(xold::lto::session::message as *const ()) };
+        // SAFETY: the format string is a live NUL-terminated literal, and
+        // the variadic arguments are plain values passed by copy.
+        unsafe {
+            call(
+                2, // LDPL_ERROR
+                c"plugin reported %s at %d (%f)".as_ptr(),
+                c"a-symbol".as_ptr(),
+                42_i32,
+                1.5_f64,
+            );
+        }
+        return;
+    }
+
+    let exe = env::current_exe().expect("the test binary has a path");
+    let out = Command::new(exe)
+        .arg("the_message_callback_reads_its_named_arguments")
+        .arg("--exact")
+        .arg("--nocapture")
+        .env(VAR, "1")
+        .output()
+        .expect("the child test binary runs");
+    let err = String::from_utf8_lossy(&out.stderr);
+    // `level` decides the severity and `format` the text: seeing both proves
+    // each named argument arrived, rather than a register the varargs took.
+    assert!(
+        err.contains("plugin reported %s at %d (%f)"),
+        "the format string must be reported as written, got: {err}"
+    );
+    assert!(
+        err.contains("error"),
+        "level 2 must be reported as an error, got: {err}"
+    );
 }

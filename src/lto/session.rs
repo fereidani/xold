@@ -113,18 +113,43 @@ fn copy_c_str(ptr: *const c_char) -> Option<Vec<u8>> {
 
 /// `LDPT_MESSAGE`: the plugin's diagnostic channel.
 ///
-/// The callback is variadic, but a plugin reporting a linker-interface
-/// problem passes a plain string; formatting arguments cannot be walked
-/// safely from Rust, so the format is reported as written. Losing a
-/// substitution is better than the alternative, which is that a plugin with
-/// no message channel calls a null pointer.
+/// `plugin-api.h` declares this
+/// `void (*)(int level, const char *format, ...)`, and a plugin does call it
+/// with substitutions. They are discarded: walking a `va_list` from Rust
+/// needs the format string parsed to know what types it holds, and a wrong
+/// guess reads the wrong register. A plugin reporting a linker-interface
+/// problem passes a plain string, so the format is reported as written.
+/// Losing a substitution is better than the alternative, which is that a
+/// plugin with no message channel calls a null pointer.
+///
+/// # Why this is declared without `...`
+///
+/// Defining a C-variadic function in Rust needs the unstable `c_variadic`
+/// feature, which would make the whole linker nightly-only for the sake of
+/// arguments this body never reads. Declaring it with just the two named
+/// parameters is sound for every target xold builds for, because a callee
+/// that touches only the named parameters cannot observe whether it was
+/// declared variadic:
+///
+/// - x86-64 System V passes `level` and `format` in `rdi` and `rsi` either way.
+///   A variadic call additionally sets `al` to the number of vector registers
+///   used, which a non-variadic callee simply never reads.
+/// - AArch64 AAPCS64 passes the first eight integer arguments in `x0`-`x7`
+///   under both forms.
+/// - Apple's arm64 variant moves the *variadic* arguments to the stack, but the
+///   named ones stay in `x0` and `x1`, which is all this reads.
+///
+/// The transfer vector erases the type to `*mut c_void` regardless, so the
+/// declaration never has to match `ld_plugin_message` for the registration
+/// to compile; it has to match only for the call to land correctly, which
+/// is what the above establishes.
 ///
 /// # Safety
 ///
 /// Called only by the plugin, through the transfer vector, under the
 /// `plugin-api.h` contract: every pointer argument is either null or valid
 /// for the duration of the call, and any count describes that many elements.
-pub unsafe extern "C" fn message(level: c_int, format: *const c_char, _: ...) {
+pub unsafe extern "C" fn message(level: c_int, format: *const c_char) {
     let text = copy_c_str(format).map_or_else(
         || "(no message)".to_string(),
         |bytes| String::from_utf8_lossy(&bytes).into_owned(),

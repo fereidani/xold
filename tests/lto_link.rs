@@ -160,6 +160,74 @@ fn a_windows_lto_program_links_and_runs_under_wine() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+/// A bitcode member is pulled out of an archive, compiled, and linked.
+///
+/// The plugin cannot see inside an archive, so the linker has to find the
+/// member itself: the same rule as for a native one -- it defines a name
+/// something references and nothing else does. `llvm-ar` is required because
+/// GNU `ar` writes no index entries for bitcode without its own plugin, and
+/// an archive with no index cannot be searched by name.
+#[test]
+#[cfg_attr(miri, ignore = "needs a host plugin and toolchain")]
+fn a_bitcode_archive_member_is_extracted_and_linked() {
+    let Some(dir) = workdir("archive") else {
+        return;
+    };
+    let Some(ar) = which("llvm-ar") else {
+        eprintln!("skipping lto archive: no llvm-ar on this host");
+        return;
+    };
+    let Some(lib) = bitcode(
+        &dir,
+        "lib",
+        b"int helper(void){return 7;}\n",
+        "x86_64-linux-gnu",
+    ) else {
+        return;
+    };
+    let Some(user) = bitcode(
+        &dir,
+        "user",
+        b"int helper(void);\nint main(void){return helper();}\n",
+        "x86_64-linux-gnu",
+    ) else {
+        return;
+    };
+    let archive = dir.join("libhelper.a");
+    let made = Command::new(ar)
+        .arg("rcs")
+        .arg(&archive)
+        .arg(&lib)
+        .status()
+        .is_ok_and(|s| s.success());
+    assert!(made, "llvm-ar builds an archive of bitcode");
+
+    let (Some(start), Some(open), Some(close)) =
+        (crt_file("crt1.o"), crt_file("crti.o"), crt_file("crtn.o"))
+    else {
+        eprintln!("skipping lto archive: no crt objects on this host");
+        return;
+    };
+    let out = dir.join("prog");
+    let linked = Command::new(xold_bin())
+        .args([&start, &open, &user, &archive])
+        .arg("-lc")
+        .arg(&close)
+        .arg("-o")
+        .arg(&out)
+        .arg("--dynamic-exec")
+        .output()
+        .expect("run xold");
+    assert!(
+        linked.status.success(),
+        "the archive member must be found and compiled: {}",
+        String::from_utf8_lossy(&linked.stderr)
+    );
+    let run = Command::new(&out).status().expect("the image must run");
+    assert_eq!(run.code(), Some(7), "the extracted member's code runs");
+    let _ = fs::remove_dir_all(&dir);
+}
+
 // --- fixtures --------------------------------------------------------------
 
 /// A working directory, or `None` when the host cannot run these at all.

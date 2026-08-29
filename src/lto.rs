@@ -37,8 +37,13 @@ pub use claim::{Claimer, Offer};
 pub use link::{Regular, resolve_claimed};
 pub use plugin::{Hooks, Output, Plugin};
 pub use resolve::{Facts, Winner, resolution};
+use rustc_hash::FxHashSet;
 
-use crate::error::{Error, Result};
+use crate::{
+    error::{Error, Result},
+    input::Format,
+    lto::link as lto_link,
+};
 
 /// Runs an LTO link: claim, resolve, compile.
 ///
@@ -67,9 +72,20 @@ pub fn compile(job: &Job<'_>) -> Result<Compiled> {
     let plugin = Plugin::load(&path, job.output, job.kind, job.options)?;
     let claimer = Claimer::new(&plugin);
     let mut regular = Regular::default();
+    // The command line's own references come first: an archive member
+    // defining `-u foo` or the entry symbol has to be reachable by the sweep
+    // below, exactly as it is for the linker's own archive pass.
+    for name in job.pinned {
+        regular.pin(name);
+    }
     let mut claimed = 0usize;
+    let mut archives: Vec<(PathBuf, Vec<u8>)> = Vec::new();
     for input in job.inputs {
         let bytes = std::fs::read(input).map_err(Error::Io)?;
+        if crate::archive::Archive::is_archive(&bytes) {
+            archives.push((input.clone(), bytes));
+            continue;
+        }
         match claimer.offer(input, bytes)? {
             Offer::Claimed { .. } => claimed = claimed.saturating_add(1),
             // The plugin does not want it, so it is a regular input and its
@@ -82,14 +98,13 @@ pub fn compile(job: &Job<'_>) -> Result<Compiled> {
             }
         }
     }
+    claimed = claimed
+        .saturating_add(claim_archive_members(&claimer, &regular, &archives)?);
     if claimed == 0 {
         return Ok(Compiled {
             plugin,
             objects: Vec::new(),
         });
-    }
-    for name in job.pinned {
-        regular.pin(name);
     }
     resolve_claimed(&regular, job.export_all)?;
     run_codegen(&plugin)?;
@@ -174,3 +189,80 @@ fn run_codegen(plugin: &Plugin) -> Result<()> {
     }
     Ok(())
 }
+
+/// Claims the bitcode members an archive owes the link.
+///
+/// A bitcode member is extracted for the same reason a native one is: it
+/// defines a name something references and nothing else defines. Claiming one
+/// declares its own references, which can owe another member, so the sweep
+/// runs to a fixpoint. Native members are left alone -- the ordinary archive
+/// pass pulls those after LTO, when the compiled objects have made their
+/// references known.
+///
+/// The last round additionally looks for the runtime calls codegen may
+/// invent. Those have no reference to be found by, because the code that
+/// calls them does not exist until the optimiser has run.
+fn claim_archive_members(
+    claimer: &Claimer<'_>,
+    regular: &Regular,
+    archives: &[(PathBuf, Vec<u8>)],
+) -> Result<usize> {
+    if archives.is_empty() {
+        return Ok(0);
+    }
+    let mut parsed = Vec::with_capacity(archives.len());
+    for (path, bytes) in archives {
+        parsed.push(crate::archive::Archive::parse(bytes, path)?);
+    }
+    let mut taken: FxHashSet<(usize, u64)> = FxHashSet::default();
+    let mut claimed = 0usize;
+    // A round claims at least one member or the sweep is done, so the member
+    // count bounds it; the constant is the ceiling on that.
+    for round in 0..MAX_ARCHIVE_ROUNDS {
+        let mut wanted = regular.undefined()?;
+        if round > 0 {
+            wanted.extend(
+                lto_link::RUNTIME_LIBCALLS.iter().map(|name| name.to_vec()),
+            );
+        }
+        let mut progressed = false;
+        for (index, archive) in parsed.iter().enumerate() {
+            for name in &wanted {
+                let Some(offset) = archive.lookup(name) else {
+                    continue;
+                };
+                if !taken.insert((index, offset)) {
+                    continue;
+                }
+                let member = archive.member(offset)?;
+                if Format::detect(&member) != Some(Format::Bitcode) {
+                    continue;
+                }
+                let label = archive
+                    .member_name(offset)
+                    .unwrap_or_else(|_| format!("0x{offset:x}"));
+                let named = archives.get(index).map_or_else(
+                    || PathBuf::from(&label),
+                    |(path, _)| path.join(&label),
+                );
+                if let Offer::Claimed { .. } =
+                    claimer.offer(&named, member.into_owned())?
+                {
+                    claimed = claimed.saturating_add(1);
+                    progressed = true;
+                }
+            }
+        }
+        if !progressed {
+            break;
+        }
+    }
+    Ok(claimed)
+}
+
+/// How many extraction rounds the archive sweep runs before giving up.
+///
+/// Each round that does anything claims a member, and an archive has finitely
+/// many; the bound is here so a lookup that kept reporting the same member
+/// could not spin.
+const MAX_ARCHIVE_ROUNDS: usize = 64;

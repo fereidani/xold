@@ -28,6 +28,17 @@ use crate::{
     },
 };
 
+/// Names LTO may call without any input having referenced them.
+///
+/// The optimiser lowers loops and struct copies into calls to these, so a
+/// definition can be needed by code that does not exist until codegen has
+/// run. lld asks LLVM for the list (`lto::LTO::getRuntimeLibcallSymbols`);
+/// that is a C++ entry point no plugin exposes, so this is the subset a
+/// freestanding target actually gets lowered to. Naming one an archive does
+/// not define costs nothing -- the lookup simply misses.
+pub const RUNTIME_LIBCALLS: [&[u8]; 4] =
+    [b"memcpy", b"memmove", b"memset", b"memcmp"];
+
 /// What the inputs that are not bitcode contribute to one name.
 #[derive(Clone, Copy, Default)]
 struct Use {
@@ -102,6 +113,42 @@ impl Regular {
 
     fn get(&self, name: &[u8]) -> Use {
         self.names.get(name).copied().unwrap_or_default()
+    }
+
+    /// The names something references and nothing yet defines.
+    ///
+    /// A pinned name counts: `-u` and the entry symbol are references the
+    /// command line made, and an archive member defining one joins the link
+    /// exactly as it would for a reference in an object. Weak references do
+    /// not, which is the rule everywhere else -- a weak undefined resolves to
+    /// zero rather than pulling a member in.
+    ///
+    /// # Errors
+    ///
+    /// Reports a poisoned session lock.
+    pub fn undefined(&self) -> Result<Vec<Vec<u8>>> {
+        let state = session::session()
+            .lock()
+            .map_err(|_| Error::Format("LTO session lock was poisoned"))?;
+        let mut out: FxHashMap<Vec<u8>, bool> = FxHashMap::default();
+        for (name, seen) in &self.names {
+            if seen.used {
+                out.insert(name.clone(), seen.defined);
+            }
+        }
+        for file in &state.claimed {
+            for sym in &file.symbols {
+                if is_definition(sym.kind) {
+                    out.insert(sym.name.clone(), true);
+                } else if sym.kind != LDPK_WEAKUNDEF {
+                    out.entry(sym.name.clone()).or_insert(false);
+                }
+            }
+        }
+        Ok(out
+            .into_iter()
+            .filter_map(|(name, defined)| (!defined).then_some(name))
+            .collect())
     }
 }
 

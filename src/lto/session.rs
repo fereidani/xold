@@ -5,7 +5,7 @@
 //! opaque handle the linker chose, and nothing else. There is therefore
 //! nowhere to hang per-link state but a global, and this module is the one
 //! place that keeps one. A process performs one link, so the lifetime is not
-//! in question; the lock is there because the plugin's ThinLTO backends are
+//! in question; the lock is there because the plugin's `ThinLTO` backends are
 //! threads.
 //!
 //! Every callback here is crossing an FFI boundary, so none of them may
@@ -134,7 +134,7 @@ fn copy_c_str(ptr: *const c_char) -> Option<Vec<u8>> {
 /// - x86-64 System V passes `level` and `format` in `rdi` and `rsi` either way.
 ///   A variadic call additionally sets `al` to the number of vector registers
 ///   used, which a non-variadic callee simply never reads.
-/// - AArch64 AAPCS64 passes the first eight integer arguments in `x0`-`x7`
+/// - `AArch64` AAPCS64 passes the first eight integer arguments in `x0`-`x7`
 ///   under both forms.
 /// - Apple's arm64 variant moves the *variadic* arguments to the stack, but the
 ///   named ones stay in `x0` and `x1`, which is all this reads.

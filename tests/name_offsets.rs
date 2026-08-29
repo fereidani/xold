@@ -86,13 +86,15 @@ fn a_section_name_offset_past_the_table_is_rejected() {
     );
 }
 
-/// An `st_name` past `.strtab` is refused when the table is read.
+/// An `st_name` past `.strtab` is refused at the parse, as a section name is.
+///
+/// Both symbol tables are located and their name columns checked once, where
+/// the file is parsed, so every later reader takes a table already known
+/// sound. That is what keeps the check off the accessors, which each pass
+/// that reads a symbol calls.
 #[test]
 fn a_symbol_name_offset_past_the_table_is_rejected() {
-    let elf = build_elf(999, 19);
-    let obj =
-        ObjectFile::parse(elf.bytes()).expect("the section names are sound");
-    let Err(err) = obj.symbol_table() else {
+    let Err(err) = ObjectFile::parse(build_elf(999, 19).bytes()) else {
         panic!("the name column points past its table")
     };
     assert!(

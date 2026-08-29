@@ -51,10 +51,10 @@ pub struct ObjectFile<'data> {
     header: &'data Ehdr64,
     sections: &'data [Shdr64],
     shstrtab: &'data [u8],
-    /// Index into [`Self::sections`] of the single `SHT_SYMTAB`, if any.
-    symtab_idx: Option<usize>,
-    /// Index into [`Self::sections`] of the single `SHT_DYNSYM`, if any.
-    dynsym_idx: Option<usize>,
+    /// The single `SHT_SYMTAB` and its string table, if any.
+    symtab: Option<SymbolTable<'data>>,
+    /// The single `SHT_DYNSYM` and its string table, if any.
+    dynsym: Option<SymbolTable<'data>>,
 }
 
 /// What relocates one input section.
@@ -102,6 +102,7 @@ impl<'data> Relocs<'data> {
 }
 
 /// A symbol table together with its string table.
+#[derive(Clone, Copy)]
 pub struct SymbolTable<'data> {
     pub syms: &'data [Sym64],
     strtab: &'data [u8],
@@ -174,20 +175,40 @@ impl<'data> ObjectFile<'data> {
             sections.iter().map(|s| s.sh_name.get()),
             "section name offset",
         )?;
-        // Resolve the symbol-table section indices once here, so the hot
-        // accessors below pay an O(1) index instead of re-scanning every
-        // section header on each call. A duplicate of either type is rejected
-        // exactly as the scanning variant did.
-        let symtab_idx = find_unique_section(sections, SHT_SYMTAB)?;
-        let dynsym_idx = find_unique_section(sections, SHT_DYNSYM)?;
+        // Build both symbol tables once here, so the hot accessors below
+        // hand back a parsed table instead of re-locating and re-validating
+        // it on each call. A duplicate of either type is rejected exactly as
+        // the scanning variant did.
+        //
+        // Validating the name offsets is what makes this worth doing: the
+        // check is linear in the symbol count, and the accessors are reached
+        // from every pass that reads a symbol -- resolution, gc, icf, layout,
+        // relocation scanning and the writer -- so leaving it there re-scans
+        // each table more than a dozen times over per link.
+        let symtab = read_symbol_table(
+            bytes,
+            sections,
+            find_unique_section(sections, SHT_SYMTAB)?,
+            "symbol table entries",
+            "symbol string table",
+            "symbol name offset",
+        )?;
+        let dynsym = read_symbol_table(
+            bytes,
+            sections,
+            find_unique_section(sections, SHT_DYNSYM)?,
+            "dynamic symbol table entries",
+            "dynamic string table",
+            "dynamic symbol name offset",
+        )?;
 
         Ok(Self {
             bytes,
             header: ehdr,
             sections,
             shstrtab,
-            symtab_idx,
-            dynsym_idx,
+            symtab,
+            dynsym,
         })
     }
 
@@ -252,61 +273,18 @@ impl<'data> ObjectFile<'data> {
     }
 
     /// The primary symbol table, if present.
+    ///
+    /// Parsed and validated once in [`Self::parse`]; this hands that back.
     pub fn symbol_table(&self) -> Result<Option<SymbolTable<'data>>> {
-        let Some(&idx) = self.symtab_idx.as_ref() else {
-            return Ok(None);
-        };
-        let symtab = self
-            .sections
-            .get(idx)
-            .ok_or(Error::OutOfRange("symbol table index"))?;
-        let strtab = self
-            .sections
-            .get(symtab.sh_link.get() as usize)
-            .ok_or(Error::OutOfRange("symbol string table index"))?;
-        let table = SymbolTable {
-            syms: view_slice(
-                self.bytes,
-                symtab,
-                core::mem::size_of::<Sym64>(),
-                "symbol table entries",
-            )?,
-            strtab: section_payload(self.bytes, strtab, "symbol string table")?,
-        };
-        table.check_names("symbol name offset")?;
-        Ok(Some(table))
+        Ok(self.symtab)
     }
 
     /// The dynamic symbol table (`.dynsym`), if present. A shared object's
-    /// exports live here; the loader resolves imports against it. The section's
-    /// `sh_link` selects the paired `.dynstr`.
+    /// exports live here; the loader resolves imports against it.
+    ///
+    /// Parsed and validated once in [`Self::parse`]; this hands that back.
     pub fn dynamic_symbols(&self) -> Result<Option<SymbolTable<'data>>> {
-        let Some(&idx) = self.dynsym_idx.as_ref() else {
-            return Ok(None);
-        };
-        let dynsym = self
-            .sections
-            .get(idx)
-            .ok_or(Error::OutOfRange("dynamic symbol table index"))?;
-        let strtab = self
-            .sections
-            .get(dynsym.sh_link.get() as usize)
-            .ok_or(Error::OutOfRange("dynamic string table index"))?;
-        let table = SymbolTable {
-            syms: view_slice(
-                self.bytes,
-                dynsym,
-                core::mem::size_of::<Sym64>(),
-                "dynamic symbol table entries",
-            )?,
-            strtab: section_payload(
-                self.bytes,
-                strtab,
-                "dynamic string table",
-            )?,
-        };
-        table.check_names("dynamic symbol name offset")?;
-        Ok(Some(table))
+        Ok(self.dynsym)
     }
 
     /// The `SHT_RELA` entries that apply to `target_shndx`, if any.
@@ -587,6 +565,37 @@ impl<'data> IntoIterator for &'data SymbolTable<'data> {
 }
 
 // --- parsing helpers ------------------------------------------------------
+
+/// Locates, views and validates one symbol table and its string table.
+///
+/// `idx` is the section index [`find_unique_section`] resolved, so a `None`
+/// simply means the file carries no table of that type.
+fn read_symbol_table<'data>(
+    bytes: &'data [u8],
+    sections: &'data [Shdr64],
+    idx: Option<usize>,
+    entries_what: &'static str,
+    strtab_what: &'static str,
+    names_what: &'static str,
+) -> Result<Option<SymbolTable<'data>>> {
+    let Some(idx) = idx else {
+        return Ok(None);
+    };
+    let symtab = sections
+        .get(idx)
+        .ok_or(Error::OutOfRange("symbol table index"))?;
+    let strtab = sections
+        .get(symtab.sh_link.get() as usize)
+        .ok_or(Error::OutOfRange("symbol string table index"))?;
+    let syms: &'data [Sym64] =
+        view_slice(bytes, symtab, core::mem::size_of::<Sym64>(), entries_what)?;
+    let table = SymbolTable {
+        syms,
+        strtab: section_payload(bytes, strtab, strtab_what)?,
+    };
+    table.check_names(names_what)?;
+    Ok(Some(table))
+}
 
 /// Whether every name offset lands inside `table`.
 ///

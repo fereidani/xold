@@ -379,6 +379,11 @@ pub fn raw_argument(
 /// The scalar settings accumulated while walking the command line. They are
 /// filled in by one pass over the arguments and then handed to `into_options`
 /// together with the collected inputs.
+///
+/// A command line is a flat bag of independent switches, so the bool count
+/// tracks the options the driver accepts rather than any state worth grouping
+/// further; [`Switches`] already holds the ones that do group.
+#[allow(clippy::struct_excessive_bools)]
 pub struct Parsed {
     pub output: PathBuf,
     /// `--build-id`: which digest the note carries, if any.

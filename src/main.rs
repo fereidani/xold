@@ -675,6 +675,13 @@ impl InputList {
 /// Ad-hoc signs a dynamic Mach-O executable on macOS. Apple Silicon's kernel
 /// validates every executable mapping; leaving the signature to a later tool
 /// makes a successfully linked image die with SIGKILL before dyld can start.
+// The `Result` is load-bearing on macOS, where this spawns `codesign` and
+// reports its failure. Everywhere else the body is `Ok(())`, which is the
+// only form clippy sees when it lints a non-darwin build.
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(clippy::unnecessary_wraps, clippy::missing_const_for_fn)
+)]
 fn ad_hoc_sign(path: &Path) -> Result<()> {
     #[cfg(target_os = "macos")]
     {

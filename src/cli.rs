@@ -288,11 +288,10 @@ fn separated(
         "-u" | "--undefined" => {
             p.undefined.push(next(args, at, "-u")?.to_string());
         }
-        "-plugin" | "-plugin-opt" => {
-            let _ = next(args, at, arg)?;
-        }
-        // ld64 driver plumbing that does not affect a non-LTO input link.
-        "-lto_library" | "-mllvm" => {
+        // Options carrying an argument a non-LTO input link has no use for:
+        // GNU's plugin controls and ld64's driver plumbing. The argument is
+        // consumed so the walk does not go on to read it as an input file.
+        "-plugin" | "-plugin-opt" | "-lto_library" | "-mllvm" => {
             let _ = next(args, at, arg)?;
         }
         "-arch" => {

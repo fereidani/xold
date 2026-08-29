@@ -928,6 +928,12 @@ struct PlannedSym {
     tentative: bool,
 }
 
+/// Whether an `n_type` is a private external: external, and scoped to the
+/// linkage unit rather than to the image's export table.
+const fn is_private_external(n_type: u8) -> bool {
+    n_type & (N_EXT | N_PEXT) == N_EXT | N_PEXT
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SymClass {
     Local,
@@ -975,10 +981,19 @@ impl<'d> SymtabPlan<'d> {
                 // external-defined row in the synthetic `__common` section,
                 // not an undefined one.
                 let tentative = typ == N_UNDF && sym.n_value > 0;
+                // A private external (`N_EXT | N_PEXT`) is scoped to the
+                // linkage unit: it takes part in the link, but it is not part
+                // of the image's external interface, so `LC_DYSYMTAB` must
+                // count it among the locals. lld routes it to `localSymbols`
+                // for the same reason (`lld/MachO/SyntheticSections.cpp`);
+                // leaving it in the external-defined range tells a consumer a
+                // linkage-unit-private name is publicly exported.
                 let class = if tentative {
                     SymClass::Extdef
                 } else if typ == N_UNDF {
                     SymClass::Undef
+                } else if is_private_external(sym.n_type) {
+                    SymClass::Local
                 } else if sym.n_type & N_EXT != 0 {
                     SymClass::Extdef
                 } else {
@@ -1672,6 +1687,11 @@ fn write_linkedit(
             // output it is a defined external in `__common`.
             let (n_type, n_sect) = if sym.tentative {
                 (N_EXT | N_SECT, common_sect)
+            } else if is_private_external(sym.n_type) {
+                // Promoted to non-external at link time: the row keeps
+                // `N_PEXT` and loses `N_EXT`, which is how the output says
+                // the name is private to this image.
+                (sym.n_type & !N_EXT, n_sect)
             } else {
                 (sym.n_type, n_sect)
             };

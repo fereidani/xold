@@ -9,7 +9,7 @@ use std::{
     path::Path,
     sync::{
         OnceLock,
-        atomic::{AtomicBool, AtomicU32, Ordering},
+        atomic::{AtomicBool, Ordering},
     },
 };
 
@@ -141,7 +141,7 @@ fn read_umask() -> u32 {
 /// creation the way a set-and-restore `umask(2)` probe would.
 #[cfg(not(target_os = "linux"))]
 fn read_umask() -> u32 {
-    use std::os::unix::fs::PermissionsExt as _;
+    use std::{os::unix::fs::PermissionsExt as _, sync::atomic::AtomicU32};
 
     const DEFAULT: u32 = 0o022;
     static NEXT: AtomicU32 = AtomicU32::new(0);

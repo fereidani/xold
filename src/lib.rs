@@ -96,6 +96,7 @@ pub mod icf;
 pub mod input;
 pub mod layout;
 pub mod linker;
+#[cfg(feature = "lto")]
 pub mod lto;
 pub mod macho;
 pub mod merge;

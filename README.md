@@ -159,7 +159,9 @@ code beside the bytecode; such an object links like any other.
   formats. `-plugin` and `-plugin-opt=` are honoured, bitcode is extracted
   from archives and `--start-lib` groups the way native objects are, and LLVM
   stays out of the build: the plugin is loaded at run time, not linked
-  against.
+  against. On by default, behind the `lto` Cargo feature; building with
+  `--no-default-features` drops the plugin host, and a bitcode input is then
+  refused by name rather than mislabelled.
 - Size and speed passes: `--gc-sections`, `--icf=all|safe`, `--strip-all`,
   `--strip-debug`, and relaxation of GOT-relative sequences.
 - The command line a driver writes: `-m`, `-pie`, `-z`, `--as-needed`,

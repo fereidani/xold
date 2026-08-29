@@ -1,3 +1,7 @@
+// The plugin host these exercise is compiled in only with the `lto`
+// feature, so without it there is nothing here to test.
+#![cfg(feature = "lto")]
+
 //! End-to-end LTO links, driven through the binary.
 //!
 //! Codegen shuts LLVM down inside the plugin, so a process gets one link.

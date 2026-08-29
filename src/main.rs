@@ -28,6 +28,10 @@ use std::{
 };
 
 use cli::{Options, Request, emulation, expand_response_files, parse};
+// Its own statement rather than a member of the group above: a `use` group
+// cannot carry an attribute on one of its names.
+#[cfg(feature = "lto")]
+use xold::lto;
 use xold::{
     buildid::BuildId,
     coff::link_coff,
@@ -37,7 +41,6 @@ use xold::{
     icf::IcfMode,
     input::{Format, Input},
     linker::{Link, link_image},
-    lto,
     macho::{Dylib, LinkOptions as MachOLinkOptions, link_macho_with_options},
     script::{self, Search},
     startlib,
@@ -374,6 +377,7 @@ fn link_macho_image(
 
 /// The entry names this linker defaults to, one per output format: ELF
 /// enters at `_start`, COFF at `main`, and Mach-O at `_main`.
+#[cfg(feature = "lto")]
 const DEFAULT_ENTRIES: [&[u8]; 3] = [b"_start", b"main", b"_main"];
 
 /// Links a set of inputs that includes bitcode.
@@ -386,6 +390,21 @@ const DEFAULT_ENTRIES: [&[u8]; 3] = [b"_start", b"main", b"_main"];
 /// The objects go in where the first bitcode input was, rather than at the
 /// end. Input order decides which archive member answers a reference, and the
 /// code the plugin compiled came from that position on the command line.
+/// Refuses bitcode in a build compiled without the `lto` feature.
+///
+/// The alternative is the reader's own "unrecognised input", which tells the
+/// user nothing about what to do: the file is fine, this binary just has no
+/// plugin host to compile it with.
+#[cfg(not(feature = "lto"))]
+const fn link_bitcode(_opts: &Options, _list: &InputList) -> Result<()> {
+    Err(Error::Format(
+        "input holds LLVM bitcode, and this build of xold was compiled \
+         without the `lto` feature that loads a plugin to compile it: \
+         rebuild xold with the feature, or build the input with -fno-lto",
+    ))
+}
+
+#[cfg(feature = "lto")]
 fn link_bitcode(opts: &Options, list: &InputList) -> Result<()> {
     let inputs: Vec<PathBuf> = list.paths().map(Path::to_path_buf).collect();
     let kind = if opts.shared {
@@ -438,6 +457,7 @@ fn link_bitcode(opts: &Options, list: &InputList) -> Result<()> {
 /// Mach-O regardless of what the host is. The input scan could not have known
 /// -- it saw only bitcode -- so the choice is made here, from the first
 /// object the plugin returned.
+#[cfg(feature = "lto")]
 fn link_compiled(
     opts: &Options,
     files: &[Input<'_>],
@@ -640,6 +660,7 @@ impl InputList {
     /// Every input with a path, in the order the command line named them.
     /// Order is what decides which definition prevails, so the plugin must be
     /// offered them in it.
+    #[cfg(feature = "lto")]
     fn paths(&self) -> impl Iterator<Item = &Path> {
         self.files.iter().filter_map(|entry| match entry {
             Entry::File(file) => Some(&*file.path),
@@ -651,6 +672,7 @@ impl InputList {
     }
 
     /// The `--start-lib` groups, as archives the LTO sweep can search.
+    #[cfg(feature = "lto")]
     fn groups(&self) -> impl Iterator<Item = (&Path, &[u8])> {
         self.files.iter().filter_map(|entry| match entry {
             Entry::Group { name, bytes } => {
@@ -666,6 +688,7 @@ impl InputList {
     /// The replacements are spliced in at the first bitcode input rather than
     /// appended. Input order decides which archive member answers a
     /// reference, and the compiled code came from that position.
+    #[cfg(feature = "lto")]
     fn views_with_lto<'a>(&'a self, objects: &'a [PathBuf]) -> Vec<Input<'a>> {
         let mut out = Vec::with_capacity(self.files.len() + objects.len());
         let mut spliced = false;
@@ -689,6 +712,7 @@ impl InputList {
     }
 
     /// One file entry as the linker takes it.
+    #[cfg(feature = "lto")]
     fn view_of(file: &Resolved) -> Input<'_> {
         match (file.as_needed, file.from_l) {
             (true, from_l) => Input::AsNeeded {

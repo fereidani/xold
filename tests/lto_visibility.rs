@@ -1,3 +1,7 @@
+// The plugin host these exercise is compiled in only with the `lto`
+// feature, so without it there is nothing here to test.
+#![cfg(feature = "lto")]
+
 //! `used_in_regular_obj` decides what LTO may delete.
 //!
 //! This is the flag whose failure mode is silence. A bitcode definition that

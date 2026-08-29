@@ -114,8 +114,13 @@ pub struct Options {
     /// `-dead_strip`: enable the Mach-O section reachability pass.
     pub macho_dead_strip: bool,
     /// `-plugin`: the LTO plugin to load, as the driver spelled it.
+    /// Parsed whatever this binary was built with: `gcc` passes `-plugin`
+    /// on every link, so refusing it would break ordinary non-LTO links.
+    /// Without the `lto` feature there is no plugin host to read it.
+    #[cfg_attr(not(feature = "lto"), allow(dead_code))]
     pub lto_plugin: Option<PathBuf>,
     /// `-plugin-opt=`: options handed to that plugin unchanged.
+    #[cfg_attr(not(feature = "lto"), allow(dead_code))]
     pub lto_plugin_opts: Vec<String>,
 }
 /// What the command line asked for.

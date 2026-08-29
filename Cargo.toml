@@ -19,6 +19,17 @@ path = "src/lib.rs"
 name = "xold"
 path = "src/main.rs"
 
+[features]
+default = ["lto"]
+
+# Link-time optimisation through the GNU linker-plugin interface. On by
+# default: a compiler driver passing `-flto` expects the linker to handle it.
+# Turning it off drops the plugin host and the `dlopen` that loads it, and a
+# bitcode input is then refused with a diagnostic saying so. Nothing else in
+# the linker changes, because the plugin's output is ordinary objects that
+# join the link like any other -- which is what keeps this separable.
+lto = []
+
 [dependencies]
 memmap2 = "0.9"
 bytemuck = { version = "1", features = ["derive"] }

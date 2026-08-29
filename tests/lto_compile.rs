@@ -1,3 +1,7 @@
+// The plugin host these exercise is compiled in only with the `lto`
+// feature, so without it there is nothing here to test.
+#![cfg(feature = "lto")]
+
 //! The full LTO handoff, in a binary of its own.
 //!
 //! Codegen is a once-per-process event: the plugin shuts LLVM down when it

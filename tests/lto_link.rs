@@ -228,6 +228,119 @@ fn a_bitcode_archive_member_is_extracted_and_linked() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+/// Bitcode inside a `--start-lib` group links, and an unused member does not
+/// reach the image.
+///
+/// A group's index is built from what the linker can read, which is not
+/// bitcode, so the LTO pass takes every bitcode member rather than searching
+/// for one. The second half of this is what makes that safe: a member
+/// nothing references is dropped by LTO, which is the same image a lazy
+/// search would have produced.
+#[test]
+#[cfg_attr(miri, ignore = "needs a host plugin and toolchain")]
+fn a_start_lib_group_of_bitcode_links_without_its_dead_members() {
+    let Some(dir) = workdir("group") else {
+        return;
+    };
+    let Some(lib) = bitcode(
+        &dir,
+        "lib",
+        b"int helper(void){return 7;}\n",
+        "x86_64-linux-gnu",
+    ) else {
+        return;
+    };
+    let Some(dead) = bitcode(
+        &dir,
+        "dead",
+        b"int unused_thing(void){return 1;}\n",
+        "x86_64-linux-gnu",
+    ) else {
+        return;
+    };
+    let Some(user) = bitcode(
+        &dir,
+        "user",
+        b"int helper(void);\nint main(void){return helper();}\n",
+        "x86_64-linux-gnu",
+    ) else {
+        return;
+    };
+    let (Some(start), Some(open), Some(close)) =
+        (crt_file("crt1.o"), crt_file("crti.o"), crt_file("crtn.o"))
+    else {
+        eprintln!("skipping lto group: no crt objects on this host");
+        return;
+    };
+    let out = dir.join("prog");
+    let linked = Command::new(xold_bin())
+        .args([&start, &open, &user])
+        .arg("--start-lib")
+        .args([&lib, &dead])
+        .arg("--end-lib")
+        .arg("-lc")
+        .arg(&close)
+        .arg("-o")
+        .arg(&out)
+        .arg("--dynamic-exec")
+        .output()
+        .expect("run xold");
+    assert!(
+        linked.status.success(),
+        "a group of bitcode must link: {}",
+        String::from_utf8_lossy(&linked.stderr)
+    );
+    let run = Command::new(&out).status().expect("the image must run");
+    assert_eq!(run.code(), Some(7), "the group member's code runs");
+    let image = fs::read(&out).expect("the image is readable");
+    assert!(
+        !contains(&image, b"unused_thing"),
+        "a member nothing references must not reach the image"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// Darwin-targeted bitcode becomes a Mach-O image.
+///
+/// It cannot be run here, so this checks the shape: LTO routed the compiled
+/// objects to the Mach-O writer rather than to the ELF one, which is decided
+/// by the objects the plugin returned and not by anything the input scan saw.
+#[test]
+#[cfg_attr(miri, ignore = "needs a host plugin and toolchain")]
+fn darwin_bitcode_produces_a_macho_image() {
+    let Some(dir) = workdir("macho") else {
+        return;
+    };
+    let Some(obj) = bitcode(
+        &dir,
+        "m",
+        b"int helper(void){return 7;}\nint main(void){return helper();}\n",
+        "x86_64-apple-darwin",
+    ) else {
+        return;
+    };
+    let out = dir.join("m.out");
+    let linked = Command::new(xold_bin())
+        .arg(&obj)
+        .arg("-o")
+        .arg(&out)
+        .args(["-arch", "x86_64"])
+        .output()
+        .expect("run xold");
+    assert!(
+        linked.status.success(),
+        "a darwin LTO link must succeed: {}",
+        String::from_utf8_lossy(&linked.stderr)
+    );
+    let image = fs::read(&out).expect("the image is readable");
+    assert_eq!(
+        image.get(..4),
+        Some([0xcf, 0xfa, 0xed, 0xfe].as_slice()),
+        "LTO on a darwin target produces a 64-bit Mach-O"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
 // --- fixtures --------------------------------------------------------------
 
 /// A working directory, or `None` when the host cannot run these at all.
@@ -269,6 +382,11 @@ fn bitcode(
 /// Compiles `source` to an ordinary host object.
 fn native(dir: &Path, stem: &str, source: &[u8]) -> Option<PathBuf> {
     build(dir, stem, source, &["-fno-lto", "-c"])
+}
+
+/// Whether `needle` appears anywhere in `haystack`.
+fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack.windows(needle.len()).any(|w| w == needle)
 }
 
 fn build(

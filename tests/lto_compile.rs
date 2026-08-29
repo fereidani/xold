@@ -42,6 +42,7 @@ fn the_plugin_compiles_claimed_bitcode_into_an_object() {
         kind: Output::Executable,
         inputs: &[obj],
         pinned: &[entry],
+        groups: &[],
         export_all: false,
     });
     let objects = match produced {

@@ -98,8 +98,17 @@ pub fn compile(job: &Job<'_>) -> Result<Compiled> {
             }
         }
     }
-    claimed = claimed
-        .saturating_add(claim_archive_members(&claimer, &regular, &archives)?);
+    let searchable: Vec<(&Path, &[u8])> = archives
+        .iter()
+        .map(|(path, bytes)| (path.as_path(), bytes.as_slice()))
+        .collect();
+    claimed =
+        claimed.saturating_add(claim_group_members(&claimer, job.groups)?);
+    claimed = claimed.saturating_add(claim_archive_members(
+        &claimer,
+        &regular,
+        &searchable,
+    )?);
     if claimed == 0 {
         return Ok(Compiled {
             plugin,
@@ -164,6 +173,10 @@ pub struct Job<'a> {
     pub inputs: &'a [PathBuf],
     /// Names the command line pinned: `-u` and the entry symbol.
     pub pinned: &'a [&'a [u8]],
+    /// `--start-lib` groups, which are archives the driver built in memory
+    /// and never wrote to disk. They are searched for bitcode members
+    /// exactly as an archive on disk is.
+    pub groups: &'a [(&'a Path, &'a [u8])],
     /// Whether the image publishes its definitions.
     pub export_all: bool,
 }
@@ -205,7 +218,7 @@ fn run_codegen(plugin: &Plugin) -> Result<()> {
 fn claim_archive_members(
     claimer: &Claimer<'_>,
     regular: &Regular,
-    archives: &[(PathBuf, Vec<u8>)],
+    archives: &[(&Path, &[u8])],
 ) -> Result<usize> {
     if archives.is_empty() {
         return Ok(0);
@@ -266,3 +279,38 @@ fn claim_archive_members(
 /// many; the bound is here so a lookup that kept reporting the same member
 /// could not spin.
 const MAX_ARCHIVE_ROUNDS: usize = 64;
+
+/// Claims every bitcode member of a `--start-lib` group.
+///
+/// A group is an archive the driver packed in memory, and its index is built
+/// from what the linker itself can read -- which is not bitcode. There is no
+/// way to ask the plugin what a member defines without handing it over, and
+/// the interface has no way to hand one back, so the members are taken
+/// rather than searched.
+///
+/// Taking one that turns out to be unnecessary costs nothing in the image.
+/// Nothing references it, so LTO reports it `PREVAILING_DEF_IRONLY` and drops
+/// it; and a name two members both define resolves the same way it would have
+/// under a search, with the loser told it was preempted.
+fn claim_group_members(
+    claimer: &Claimer<'_>,
+    groups: &[(&Path, &[u8])],
+) -> Result<usize> {
+    let mut claimed = 0usize;
+    for (name, bytes) in groups {
+        for (index, member) in
+            crate::archive::members(bytes)?.iter().enumerate()
+        {
+            if Format::detect(member) != Some(Format::Bitcode) {
+                continue;
+            }
+            let label = name.join(format!("member {index}"));
+            if let Offer::Claimed { .. } =
+                claimer.offer(&label, (*member).to_vec())?
+            {
+                claimed = claimed.saturating_add(1);
+            }
+        }
+    }
+    Ok(claimed)
+}

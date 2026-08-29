@@ -64,6 +64,7 @@ fn a_native_reference_keeps_a_bitcode_definition() {
         kind: Output::Executable,
         inputs: &[bitcode, native],
         pinned: &[entry],
+        groups: &[],
         export_all: false,
     })
     .expect("the plugin must compile the bitcode")

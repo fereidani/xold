@@ -408,6 +408,7 @@ fn link_bitcode(opts: &Options, list: &InputList) -> Result<()> {
     } else if !opts.shared {
         pinned.extend_from_slice(&DEFAULT_ENTRIES);
     }
+    let groups: Vec<(&Path, &[u8])> = list.groups().collect();
     let compiled = lto::compile(&lto::Job {
         named_plugin: opts.lto_plugin.as_deref(),
         options: &opts.lto_plugin_opts,
@@ -415,6 +416,7 @@ fn link_bitcode(opts: &Options, list: &InputList) -> Result<()> {
         kind,
         inputs: &inputs,
         pinned: &pinned,
+        groups: &groups,
         export_all: opts.shared || opts.export_dynamic,
     })?;
     let files = list.views_with_lto(&compiled.objects);
@@ -451,11 +453,7 @@ fn link_compiled(
             let entry = default_entry(opts, b"main");
             link_coff(files, &opts.output, entry, opts.shared)
         }
-        Some(Format::MachO) => Err(Error::CommandLine(
-            "link-time optimisation produced Mach-O objects, which this \
-             link path does not yet consume"
-                .into(),
-        )),
+        Some(Format::MachO) => link_macho_image(opts, list, files),
         // ELF, and anything the readers will reject by name themselves.
         _ => link_elf(opts, files, list.scan.shared),
     }
@@ -645,6 +643,16 @@ impl InputList {
             // held in memory, and offering one to the plugin needs the group
             // reader that lazy bitcode extraction will bring.
             Entry::Group { .. } => None,
+        })
+    }
+
+    /// The `--start-lib` groups, as archives the LTO sweep can search.
+    fn groups(&self) -> impl Iterator<Item = (&Path, &[u8])> {
+        self.files.iter().filter_map(|entry| match entry {
+            Entry::Group { name, bytes } => {
+                Some((name.as_path(), bytes.as_slice()))
+            }
+            Entry::File(_) => None,
         })
     }
 

@@ -100,6 +100,15 @@ fn symbol_index(members: &[(PathBuf, Vec<u8>)]) -> Result<Vec<(&[u8], usize)>> {
     let mut index: Vec<(&[u8], usize)> = Vec::new();
     let mut seen: FxHashSet<&[u8]> = FxHashSet::default();
     for (i, (_, bytes)) in members.iter().enumerate() {
+        // A bitcode member carries no symbol table this can read: only the
+        // LTO plugin knows what it defines. It is left out of the index and
+        // picked up by the LTO pass instead, which reads it through the
+        // plugin before the archive is ever searched by name.
+        if crate::input::Format::detect(bytes)
+            == Some(crate::input::Format::Bitcode)
+        {
+            continue;
+        }
         let obj = ObjectFile::parse(bytes)?;
         if !obj.is_relocatable() {
             return Err(Error::Format(

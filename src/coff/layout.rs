@@ -372,13 +372,34 @@ fn is_rsrc_section(name: &[u8]) -> bool {
 /// (`.debug_*`), the exception tables (`.pdata`, `.xdata`) need machinery
 /// beyond this phase (SEH unwind registration, debug directory) and are
 /// deferred.
+///
+/// The `$` forms are deferred with the bare names. A compiler emitting one
+/// section per function writes `.pdata$foo` and `.xdata$foo`, and matching
+/// only the exact names let those through to be placed as ordinary read-only
+/// data: unwind records nothing points at, since no `.pdata` output section
+/// or exception data directory is built. Whether the input was compiled with
+/// one section per function is not something the treatment of its unwind
+/// tables should turn on.
 fn is_deferred(name: &[u8]) -> bool {
     let trim = trim_nul(name);
     trim.starts_with(b".debug")
-        || matches!(
-            trim,
-            b".pdata" | b".xdata" | b".llvm_addrsig" | b".drectve"
-        )
+        || is_unwind_section(trim)
+        || matches!(trim, b".llvm_addrsig" | b".drectve")
+}
+
+/// Whether `name` is an exception-table section, in either the bare or the
+/// per-function `$` form.
+fn is_unwind_section(name: &[u8]) -> bool {
+    for base in [b".pdata".as_slice(), b".xdata".as_slice()] {
+        if name == base
+            || name
+                .strip_prefix(base)
+                .is_some_and(|rest| rest.starts_with(b"$"))
+        {
+            return true;
+        }
+    }
+    false
 }
 
 /// The sort key for an output section: code, rdata, data, bss, tls, tlsdir,

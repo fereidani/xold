@@ -1,6 +1,6 @@
 [package]
 name = "xold"
-version = "0.0.3"
+version = "0.0.4"
 edition = "2024"
 description = "A maintainable multi-threaded linker for ELF, Mach-O and COFF."
 license = "MIT"

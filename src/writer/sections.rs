@@ -75,6 +75,14 @@ pub(super) struct CopyItem {
     /// dropped, or `None` when such a site is not to be tombstoned. Set only
     /// for `.debug_*` members; see [`Patch::tombstone`].
     pub(super) tombstone: Option<u64>,
+    /// Whether a reference into an ICF-folded section is tombstoned too.
+    ///
+    /// Folding leaves the losing section placed at the winner's address, so
+    /// without this a second compilation unit describes code it no longer
+    /// owns. lld tombstones the folded case everywhere except `.debug_line`,
+    /// where keeping the real address is what lets a debugger still break on
+    /// a folded-in function (`relocateNonAlloc`).
+    pub(super) folded_tombstone: bool,
     /// Whether this member's file had any section placement dropped.
     ///
     /// The other half of the tombstone question. A debug member points a
@@ -110,6 +118,7 @@ fn copy_work_items(
             let vaddr = layout.section_vaddr(m.file, m.section)?;
             (len != 0).then(|| CopyItem {
                 tombstone: None,
+                folded_tombstone: false,
                 has_discarded: false,
                 file: m.file,
                 section: m.section,
@@ -506,6 +515,16 @@ impl Patch<'_, '_> {
         // string reference in `.debug_info` and `.debug_line` names one.
         if self.ctx.merge.is_merged(self.item.file, shndx) {
             return None;
+        }
+        // An ICF-folded section keeps a placed address -- the winner's, which
+        // `apply_folding` stamped into its slot -- so the absent-address test
+        // below never catches it. Left alone, the loser's compilation unit
+        // claims the winner's code and two units own one range, which is the
+        // ambiguity the tombstone exists to prevent.
+        if self.item.folded_tombstone
+            && self.ctx.folding.is_folded((self.item.file, shndx))
+        {
+            return Some(value);
         }
         self.layout
             .section_vaddr(self.item.file, shndx)

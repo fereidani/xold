@@ -65,6 +65,9 @@ pub(super) fn write_debug_bytes(
             continue;
         };
         let tombstone = Some(tombstone_for(&sec.name));
+        // `.debug_line` deliberately keeps pointing at the surviving copy of
+        // a folded function, so a debugger can still put a breakpoint on it.
+        let folded_tombstone = sec.name.as_slice() != b".debug_line";
         for m in &sec.members {
             let len = usize::try_from(m.size).unwrap_or(0);
             if len == 0 {
@@ -86,6 +89,7 @@ pub(super) fn write_debug_bytes(
                 // PC-relative site to a deterministic value.
                 vaddr: m.out_offset,
                 tombstone,
+                folded_tombstone,
             });
         }
     }

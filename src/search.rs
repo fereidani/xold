@@ -159,7 +159,7 @@ pub fn find_library_kind(
         (Some(file), LibKind::Any) => find_exact(file, dir),
         (Some(file), LibKind::ArchiveOnly) => {
             let path = dir.join(file);
-            has_magic(&path, ARCHIVE_MAGIC).then_some(path)
+            is_archive(&path).then_some(path)
         }
         (None, LibKind::Any) => find_in(name, dir),
         (None, LibKind::ArchiveOnly) => find_archive(name, dir),
@@ -231,7 +231,7 @@ pub fn rooted(sysroot: Option<&Path>, path: &str) -> PathBuf {
 /// object, an archive or a linker script according to its own contents.
 fn find_exact(file: &str, dir: &Path) -> Option<PathBuf> {
     let path = dir.join(file);
-    (has_magic(&path, ARCHIVE_MAGIC) || is_linkable(&path)).then_some(path)
+    (is_archive(&path) || is_linkable(&path)).then_some(path)
 }
 
 /// Looks for `name`'s library inside one directory: a real-ELF
@@ -292,8 +292,7 @@ fn find_in(name: &str, dir: &Path) -> Option<PathBuf> {
         return Some(path);
     }
     let archive = dir.join(format!("lib{name}.a"));
-    (has_magic(&archive, ARCHIVE_MAGIC) || is_script(&archive))
-        .then_some(archive)
+    (is_archive(&archive) || is_script(&archive)).then_some(archive)
 }
 
 /// Looks for `name`'s archive inside one directory, which is all a `-Bstatic`
@@ -304,8 +303,7 @@ fn find_in(name: &str, dir: &Path) -> Option<PathBuf> {
 /// which files it is made of.
 fn find_archive(name: &str, dir: &Path) -> Option<PathBuf> {
     let archive = dir.join(format!("lib{name}.a"));
-    (has_magic(&archive, ARCHIVE_MAGIC) || is_script(&archive))
-        .then_some(archive)
+    (is_archive(&archive) || is_script(&archive)).then_some(archive)
 }
 
 /// Whether the shared-object candidate at `path` is one the link can consume:
@@ -360,6 +358,13 @@ const ELF_MAGIC: &[u8] = b"\x7fELF";
 /// The bytes an `ar` archive opens with.
 const ARCHIVE_MAGIC: &[u8] = b"!<arch>\n";
 
+/// The bytes a thin `ar` archive opens with.
+///
+/// A thin archive stores the paths of its members instead of their bytes.
+/// `archive::Archive` reads both flavours, so a search that probed only
+/// `!<arch>\n` reported a valid `libNAME.a` as missing.
+const THIN_ARCHIVE_MAGIC: &[u8] = b"!<thin>\n";
+
 /// The longest magic this module probes for, which fixes the read buffer.
 const MAGIC_MAX: usize = 8;
 
@@ -369,24 +374,39 @@ const MAGIC_MAX: usize = 8;
 /// candidate directory, and the files it probes are whole shared libraries,
 /// so reading one to look at four bytes would be megabytes of pure waste.
 fn has_magic(path: &Path, magic: &[u8]) -> bool {
-    debug_assert!(magic.len() <= MAGIC_MAX, "magic fits the probe buffer");
+    has_any_magic(path, &[magic])
+}
+
+/// Whether the file at `path` opens with any of `magics`.
+///
+/// The head is read once and compared against each candidate, so probing for
+/// both archive flavours costs one open rather than two.
+fn has_any_magic(path: &Path, magics: &[&[u8]]) -> bool {
+    let want = magics.iter().map(|m| m.len()).max().unwrap_or(0);
+    debug_assert!(want <= MAGIC_MAX, "magic fits the probe buffer");
     let Ok(mut file) = std::fs::File::open(path) else {
         return false;
     };
     let mut head = [0u8; MAGIC_MAX];
-    let Some(slot) = head.get_mut(..magic.len()) else {
+    let Some(slot) = head.get_mut(..want) else {
         return false;
     };
     // `read` may stop short of the buffer even when the file is longer, so
-    // the head is filled in a loop rather than in one call.
+    // the head is filled in a loop rather than in one call. A zero-length
+    // read is end of file: the candidate is shorter than the longest magic,
+    // which still leaves it able to match a shorter one.
     let mut filled = 0usize;
     while filled < slot.len() {
-        // A zero-length read is end of file: the candidate is shorter than
-        // the magic and so is not what it claims to be.
         let Ok(n @ 1..) = file.read(&mut slot[filled..]) else {
-            return false;
+            break;
         };
         filled = filled.saturating_add(n);
     }
-    slot == magic
+    let read = slot.get(..filled).unwrap_or(&[]);
+    magics.iter().any(|m| read.get(..m.len()) == Some(*m))
+}
+
+/// Whether the file at `path` is an `ar` archive of either flavour.
+fn is_archive(path: &Path) -> bool {
+    has_any_magic(path, &[ARCHIVE_MAGIC, THIN_ARCHIVE_MAGIC])
 }
